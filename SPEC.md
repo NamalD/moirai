@@ -7,14 +7,14 @@ created: 2026-07-08
 updated: 2026-07-08
 status: draft
 repo: NamalD/moirai
-language: Python (stdlib only, zero pip dependencies)
+language: Python (PyYAML for YAML parsing, stdlib for everything else)
 ---
 
 # Moirai — Deterministic Agent Task Graph Scheduler
 
 ## 1. Overview
 
-Moirai is a deterministic **agent task graph scheduler** built in pure Python (standard library only, zero pip dependencies). It orchestrates multi-step agent workflows by accepting a high-level user prompt and driving it through a pipeline of components — from natural-language intent to a validated state machine to deterministic task execution.
+Moirai is a deterministic **agent task graph scheduler** built in Python with PyYAML for YAML parsing and the standard library for everything else. It orchestrates multi-step agent workflows by accepting a high-level user prompt and driving it through a pipeline of components — from natural-language intent to a validated state machine to deterministic task execution.
 
 The system is named after the **Moirai** (the three Fates of Greek mythology) and related figures, reflecting each component's role in weaving, measuring, and cutting the threads of a workflow.
 
@@ -22,13 +22,13 @@ At a high level, Moirai:
 
 1. Accepts a user's natural-language prompt describing a desired workflow.
 2. Uses an LLM-powered component (**Clotho**) to generate a YAML workflow artifact.
-3. Validates the YAML via another LLM component (**Themis**) which performs semantic validation, then passes to a deterministic **GraphValidator** for structural checks (acyclicity, well-formed transitions).
+3. Validates the YAML via a deterministic component (**Themis**) which performs both semantic and structural validation. GraphValidator is folded into Themis as an internal class for DAG acyclicity checks and topological sort.
 4. Executes the state machine deterministically via a scheduler (**Lachesis**).
 5. Handles mid-flight changes, task failures, and timeouts through dedicated consolidation (**Penelope**) and cleanup (**Atropos**) components.
 
 **Key design principles:**
-- **Deterministic execution** — the scheduling, task graph traversal, graph validation, consolidation, and cleanup are purely deterministic, with non-determinism isolated to the LLM components (Clotho, Themis).
-- **Zero external dependencies** — the entire runtime uses only Python's standard library. YAML is emitted/consumed as raw strings (no YAML parser library needed).
+- **Deterministic execution** — only Clotho (LLM-powered YAML generation) is non-deterministic. Themis, GraphValidator, Lachesis, Penelope, and Atropos are all deterministic coded components. Non-determinism is isolated exclusively to Clotho.
+- **PyYAML for parsing** — uses the established PyYAML library for robust YAML parsing and emission, with the standard library for everything else.
 - **Error recovery via retry loops** — validation failures, hanging tasks, and problematic YAML changes trigger structured retry loops with escalation to human intervention when limits are exceeded.
 - **Testability by design** — all component boundaries are defined as Python Protocol interfaces, enabling test doubles (fakes/mocks) for isolated unit testing.
 
@@ -43,9 +43,9 @@ moirai/
 ├── config.py              # Config dataclass, env/file loading, validation
 ├── types.py               # All shared data structures (dataclasses, TypedDicts)
 ├── protocols.py           # All interface protocols (LLMClient, PersistenceBackend, etc.)
-├── clotho.py              # Clotho — LLM-powered YAML generation
-├── themis.py              # Themis — LLM-powered semantic validation
-├── graph_validator.py     # Deterministic DAG acyclicity & structural checks
+|├── clotho.py              # Clotho — LLM-powered YAML generation (only LLM component)
+├── themis.py              # Themis — deterministic YAML validation + state machine generation (contains GraphValidator as internal class)
+├── graph_validator.py     # (Deprecated in v5 — folded into themis.py as Themis._graph_validator)
 ├── lachesis.py            # Lachesis — deterministic scheduler
 ├── loop_executor.py       # LoopExecutor — standalone loop iteration manager
 ├── penelope.py            # Penelope — deterministic consolidation
@@ -139,6 +139,7 @@ class AgentDef:
 class TaskDef:
     """A task definition within a workflow YAML artifact."""
     id: str                              # Stable task identifier (across YAML versions)
+    type: str = "agent"                  # (v5) Task type: "agent" (runs via LLM agent like Hermes) or "script" (direct shell command, no AI agent needed)
     agent: str                           # References AgentDef.id
     command: str                         # Shell command to execute
     deps: list[str] = field(default_factory=list)  # Task IDs this task depends on
@@ -572,10 +573,10 @@ class LoopIterationResult:
 
 ## 5. YAML Workflow Schema
 
-The YAML artifact is a string emitted by Clotho and consumed by Themis. Since Moirai uses stdlib only (no PyYAML), YAML is:
-- **Emitted** as raw strings by Clotho (using string formatting/templates)
-- **Parsed** by a minimal handwritten YAML parser in `moirai/yaml_util.py` supporting the subset below
-- **Validated semantically** by Themis (LLM) after structural parsing
+The YAML artifact is a string emitted by Clotho and consumed by Themis. YAML is:
+- **Emitted** as a raw string by Clotho (using string formatting/templates or PyYAML's `yaml.dump()`)
+- **Parsed** by Themis using PyYAML's `yaml.safe_load()` into Python dicts for validation
+- **Validated** structurally by Themis's internal GraphValidator
 
 ### Schema
 
@@ -659,6 +660,7 @@ workflow:
 | `workflow.agents[].command` | agent | yes | string | Executable path or command template |
 | `workflow.tasks[]` | workflow | yes | list | Task definitions |
 | `workflow.tasks[].id` | task | yes | string | Stable task identifier |
+| `workflow.tasks[].type` | task | no (default: `"agent"`) | string | (v5) Task type: `"agent"` (LLM agent tasks like Hermes) or `"script"` (direct shell commands) |
 | `workflow.tasks[].agent` | task | yes | string | References an agent ID |
 | `workflow.tasks[].command` | task | yes | string | Shell command to execute |
 | `workflow.tasks[].deps` | task | yes | list of strings | Task IDs this task depends on (unified field name — used for both outer and inner steps) |
@@ -688,11 +690,11 @@ workflow:
 
 ---
 
-## 6. GraphValidator — Deterministic Structural Validation
+## 6. GraphValidator — Deterministic Structural Validation (Internal to Themis)
 
-**New component** (extracted from Themis). While Themis handles semantic validation via LLM, **GraphValidator** handles all deterministic structural checks.
+**New component** — GraphValidator is now an internal class within Themis (folded in per user design preference). While Themis handles combined semantic + structural validation deterministically, **GraphValidator** is the internal class/method that handles all deterministic DAG checks.
 
-**Role:** Validates that a parsed workflow YAML forms a valid DAG with well-formed transitions. Runs *after* Themis's semantic validation and *before* Lachesis accepts the StateMachine.
+**Role:** Validates that a parsed workflow YAML forms a valid DAG with well-formed transitions. Runs within Themis during validation, *after* basic YAML parsing and *before* the StateMachine is output.
 
 **Nature:** Fully deterministic. Simple graph algorithms — no LLM involvement.
 
@@ -733,9 +735,9 @@ workflow:
 - These invariants are tested via table-driven GraphValidator test fixtures (see §19.1).
 
 **Assumptions:**
-- The YAML has already been structurally parsed (basic YAML → dict conversion) before reaching GraphValidator.
-- Themis has already verified semantic correctness (agent names match real agents, commands are plausible).
-- GraphValidator outputs a `StateMachine` with `entry_points`, `dependencies`, and a topologically sorted task order.
+- The YAML has already been structurally parsed (via PyYAML → Python dicts) before reaching GraphValidator.
+- Themis has already verified basic correctness (agent names match real agents, commands exist, YAML is well-formed).
+- GraphValidator is called as a method on Themis — it outputs a `StateMachine` with `entry_points`, `dependencies`, and a topologically sorted task order.
 - Loop steps are opaque to the outer DAG — GraphValidator does NOT analyze the internal structure of loops for cycle detection in the outer graph.
 
 ---
@@ -766,8 +768,8 @@ workflow:
 | `escalation_message` | `str` | Free-text message to the user explaining what additional information is required |
 
 **Assumptions:**
-- Clotho has access to a configured `LLMClient` (via dependency injection — not hardcoded).
-- Clotho understands the YAML schema for workflow artifacts (defined in §5).
+- Clotho has access to a configured `LLMClient` (via dependency injection — not hardcoded) with a configurable base CLI command. The provider backend is configured via `clotho_provider` and `clotho_base_command` (default: `hermes --profile Clotho`), allowing future swaps to Claude Code, OpenAI API, or other providers.
+- Clotho understands the YAML schema for workflow artifacts (defined in §5). It generates `type: "agent"` or `type: "script"` tasks as appropriate based on the prompt and task nature.
 - Clotho can escalate to the user when the prompt is ambiguous or incomplete.
 - The YAML output is syntactically valid YAML, but *not* guaranteed to be semantically valid — that is Themis's job.
 - Clotho has a configurable timeout; if exceeded, Clotho is killed and the user is notified.
@@ -791,57 +793,63 @@ class HangingTaskInfo:
 
 ---
 
-### 7.2 Themis — Semantic Validator (LLM, Non-deterministic)
+### 7.2 Themis — YAML Validator & State Machine Generator (Deterministic)
 
-**Role:** Themis validates the YAML workflow artifact produced by Clotho, checking that tasks have semantically correct properties, agents referenced match known agents, and the workflow makes logical sense. On success, it passes the parsed data to GraphValidator for structural checks. On failure, it returns structured errors to Clotho.
+**Role:** Themis validates the YAML workflow artifact produced by Clotho and produces a validated `StateMachine`. It performs all YAML parsing (via PyYAML), structural validation (including DAG acyclicity checks via its internal GraphValidator), and semantic validation (checking agent references, command validity, input parameter consistency). Themis is the sole deterministic validator — no LLM involvement.
 
-**Nature:** LLM-powered, non-deterministic.
+**Nature:** Fully deterministic. Pure logic — no LLM involvement.
 
 > **Note:** The existing Hermes profile named `themis` will need renaming to avoid a naming conflict with this component.
 
 **Inputs:**
 | Input | Type | Description |
 |-------|------|-------------|
-| `yaml_artifact` | `str` | The YAML workflow string to validate |
+| `yaml_artifact` | `str` | The YAML workflow string to validate and process |
 | `known_agents` | `list[AgentDef]` | List of agents from the agent registry, for cross-referencing |
 
 **Outputs:**
 | Output | Type | Description |
 |--------|------|-------------|
-| `parsed_workflow` | `ParsedWorkflow` | Structurally parsed workflow data (dict form) |
-| `validation_errors` | `list[ValidationError]` | Structured error list describing semantic issues |
-| `is_valid` | `bool` | Whether the YAML passed semantic validation |
+| `state_machine` | `Optional[StateMachine]` | Validated state machine (if all checks pass) |
+| `validation_errors` | `list[ValidationError]` | Structured error list describing issues found |
+| `is_valid` | `bool` | Whether the YAML passed all validation |
 
-**Themis handles (semantic validation):**
-- Agent names in `known_agents` are semantically meaningful and correctly referenced.
-- Task commands are plausible and well-formed for their assigned agent.
-- Input parameter references (e.g., `{{ .inputs.xxx }}`) reference valid input keys.
-- The workflow description matches the user's intent.
-- No ambiguous or contradictory task definitions.
-- Loop step `terminate_on` conditions are semantically meaningful.
-- Loop step `max_iterations` is a reasonable bound given the workflow intent.
+**Themis handles:**
+1. **YAML parsing** — parses the YAML string via `yaml.safe_load()` into Python dicts.
+2. **Schema validation** — checks required fields exist, field types are correct, structure matches the schema defined in §5.
+3. **Agent cross-referencing** — verifies every task's `agent` field references an existing agent ID from the agent registry. This applies to both regular tasks and loop inner steps.
+4. **Command validation** — checks that referenced commands are plausible and exist (basic path checking).
+5. **Input parameter validation** — checks that `{{ .inputs.xxx }}` references match valid input keys.
+6. **DAG structural validation** — delegates to internal GraphValidator for: acyclicity (DFS-based cycle detection), topological ordering, dependency integrity, entry-point detection, orphan-task detection, self-loop detection, loop step inner validation (inner dependency scoping, connectivity, non-empty steps, positive max_iterations), cross-boundary dependency rejection.
+7. **Loop opaqueness verification** — ensures outer cycle through a loop step is detected, inner cycle does NOT cause outer acyclicity failure, cross-boundary references are rejected.
 
-**Themis does NOT handle (deterministic checks delegated to GraphValidator):**
-- DAG acyclicity (cycle detection) — see §6 GraphValidator.
-- Dependency graph structure / topological ordering.
-- Missing task ID references (handled structurally).
-- State machine well-formedness (handled structurally).
-- Loop step inner dependency scoping (handled structurally).
+**Themis does NOT handle:**
+- Natural-language understanding of the prompt — that is Clotho's job.
+- LLM-based semantic analysis — all validation is deterministic.
+
+**Pipeline position:**
+```
+User Prompt → Clotho (LLM) → YAML → Themis (deterministic: parse + validate + GraphValidator) → StateMachine → Lachesis
+```
 
 **Assumptions:**
-- Themis has access to a configured `LLMClient` (same or different from Clotho's).
 - The YAML schema is documented (§5) and stable across versions.
-- Themis outputs parsed data that GraphValidator can consume.
-- Validation errors use the `ValidationError` structure defined in §3, which Clotho can parse and act upon.
-- Themis uses the `LLMClient` protocol with exponential backoff on transient errors.
+- The agent registry is loaded and available at validation time.
+- Validation errors use the `ValidationError` structure defined in §3.
+- GraphValidator is an internal class (`Themis._graph_validator`) that Themis calls during validation.
 
 ---
 
-### 7.3 GraphValidator — Deterministic Structural Validator
+### 7.3 GraphValidator — Internal Class within Themis
 
-(See §6 above for full definition.)
+GraphValidator is now an internal class/method within the Themis component (folded in per user design preference). See §6 for the full definition.
 
-**Pipeline position:** User Prompt → Clotho → YAML → Themis (semantic) → GraphValidator (structural) → StateMachine → Lachesis
+**Pipeline position:**
+```
+User Prompt → Clotho (LLM) → YAML → Themis (deterministic: parse → schema validate → GraphValidator structural checks → StateMachine) → Lachesis
+```
+
+The old standalone pipeline (Clotho → Themis → GraphValidator) is replaced by a single Themis pass that internally calls GraphValidator for DAG structural checks.
 
 ---
 
@@ -1179,64 +1187,60 @@ When human intervention is required (Atropos cleanup, retry exhaustion, Clotho t
 ### 11.1 Normal Flow (Happy Path)
 
 ```
-User Prompt → Clotho → YAML → Themis → Parsed → GraphValidator → StateMachine → Lachesis → Execute Tasks
+User Prompt → Clotho (LLM) → YAML → Themis → StateMachine → Lachesis → Execute Tasks
 ```
+                                       (parse + validate + GraphValidator)
 
 1. **User submits** a natural-language prompt describing the workflow.
-2. **Clotho** (LLM) generates a YAML workflow artifact.
-3. **Themis** (LLM) validates the YAML semantically — checks agent references, command plausibility, input parameter validity.
-4. **GraphValidator** (deterministic) checks structural properties — acyclicity, well-formed dependencies, topological ordering.
-5. If all checks pass, GraphValidator outputs a formal `StateMachine`.
-6. **Lachesis** takes the state machine and begins executing tasks according to the DAG.
-7. On completion, Lachesis reports a successful execution summary.
+2. **Clotho** (LLM, only non-deterministic component) generates a YAML workflow artifact.
+3. **Themis** (deterministic) parses the YAML via PyYAML, validates the schema, cross-references agents, and runs internal GraphValidator for DAG structural checks (acyclicity, topological ordering, dependency integrity).
+4. If all checks pass, Themis outputs a formal `StateMachine`.
+5. **Lachesis** takes the state machine and begins executing tasks according to the DAG.
+6. On completion, Lachesis reports a successful execution summary.
 
 ### 11.2 Validation Failure Loop (Clotho ↔ Themis ↔ GraphValidator Retry)
 
 ```
-Clotho → YAML → Themis → Errors → Clotho (retry) → YAML → Themis → ...
-                                                                     ↓
-                                                              GraphValidator
-                                                                     ↓
-                                                              (passes eventually)
-                                                                     ↓
-                                                              Lachesis
+Clotho (LLM) → YAML → Themis (deterministic, incl. GraphValidator) → Errors → Clotho (retry) → ...
+                                                                                   ↓
+                                                                            (passes eventually)
+                                                                                   ↓
+                                                                            Lachesis
 ```
 
 1. **Clotho** generates YAML.
-2. **Themis** rejects the YAML with structured `validation_errors` (semantic issues).
-3. Clotho receives the previous YAML + validation errors + any GraphValidator structural errors.
+2. **Themis** (deterministic) rejects the YAML with structured `validation_errors` (schema issues, agent cross-reference errors, DAG structural problems from internal GraphValidator).
+3. Clotho receives the previous YAML + validation errors.
 4. **Clotho retries** — generates a new YAML informed by the errors. Uses exponential backoff (1s, 2s, 4s, ..., max 30s) between attempts. Clotho should produce a *different* YAML than the previous attempt — identical re-submissions are detected and rejected.
-5. If Clotho's YAML passes Themis, it goes to **GraphValidator** for structural checks.
-6. If GraphValidator finds issues, its errors are also fed back to Clotho for another retry.
-7. The cycle repeats for a configured number of retries (`max_retries`).
-8. **On success**: GraphValidator produces a state machine → passes to Lachesis.
-9. **On exhaustion**: If Clotho fails after `max_retries` attempts, the system escalates to the user with all captured errors and the last YAML attempt.
+5. The cycle repeats for a configured number of retries (`max_retries`).
+6. **On success**: Themis produces a state machine → passes to Lachesis.
+7. **On exhaustion**: If Clotho fails after `max_retries` attempts, the system escalates to the user with all captured errors and the last YAML attempt.
 
 ### 11.3 Mid-Flight YAML Change (Task Hanging Recovery)
 
 ```
-Lachesis detects hang → Clotho (with TaskInvestigator) → New YAML → Themis validates → GraphValidator → New StateMachine
-                                                                                                   ↓
-                                                                                            Penelope consolidates
-                                                                                                   ↓
-                                                                                            (can consolidate?)
-                                                                                             /            \
-                                                                                         Yes             No
-                                                                                          ↓               ↓
-                                                                               Update persistence    Clotho retries
-                                                                               Resume execution      (with consolidation errors)
-                                                                                                        ↓
-                                                                                                 (exhausted?)
-                                                                                                  /        \
-                                                                                              Yes         No
-                                                                                               ↓           ↓
-                                                                                        Human escalation  Clotho retries
+Lachesis detects hang → Clotho (LLM, with TaskInvestigator) → New YAML → Themis (deterministic → StateMachine)
+                                                                                                    ↓
+                                                                                             Penelope consolidates
+                                                                                                    ↓
+                                                                                             (can consolidate?)
+                                                                                              /            \
+                                                                                          Yes             No
+                                                                                           ↓               ↓
+                                                                                Update persistence    Clotho retries
+                                                                                Resume execution      (with consolidation errors)
+                                                                                                         ↓
+                                                                                                  (exhausted?)
+                                                                                                   /        \
+                                                                                               Yes         No
+                                                                                                ↓           ↓
+                                                                                         Human escalation  Clotho retries
 ```
 
 1. **Lachesis** detects a hanging task (crashes X times, timeout exceeded).
 2. Clotho is invoked with `HangingTaskInfo` (task ID, failure reason, previous YAML, current execution state) and a bounded `TaskInvestigator` context.
 3. Clotho investigates using only the `TaskInvestigator` methods (read logs, get task state, list tasks) and generates a **new YAML** workflow.
-4. The new YAML is passed to **Themis** for semantic validation, then to **GraphValidator** for structural validation.
+4. The new YAML is passed to **Themis** (deterministic) for combined parsing, validation, and GraphValidator structural checks. Themis outputs a new `StateMachine` or returns structured errors to Clotho.
 5. **Penelope** compares the old and new state machines against the current execution state (captured atomically with Lachesis paused).
 6. **If consolidatable:**
    - Penelope's two-phase process validates the plan, then applies it atomically.
@@ -1356,7 +1360,10 @@ class MoiraiConfig:
     max_crashes: int = 3                       # Max task restarts before invoking Atropos
     task_timeout: int = 3600                   # Max seconds a task may run (default 1h)
     clotho_timeout: int = 120                  # Max seconds Clotho has to generate YAML (default 2min)
-    themis_timeout: int = 60                   # Max seconds Themis has to validate (default 1min)
+    
+    # Clotho provider (v5)
+    clotho_provider: str = "hermes"            # Provider backend for Clotho: "hermes", "claude-code", "openai", "generic"
+    clotho_base_command: str = "hermes --profile Clotho"  # Base CLI command for Clotho (configurable for provider swaps)
     
     # Atropos
     atropos_sigterm_grace: int = 10            # Seconds after SIGTERM before SIGKILL
@@ -1772,16 +1779,16 @@ The following questions are not yet resolved and require design decisions:
 | Term | Definition |
 |------|------------|
 | **Moirai** | The project itself; named after the three Fates of Greek mythology |
-| **Clotho** | Spinner — LLM component that turns user prompts into YAML workflows |
-| **Themis** | Titaness of divine law — LLM component that validates YAML semantically |
-| **GraphValidator** | Deterministic component that checks DAG acyclicity and structural well-formedness |
+| **Clotho** | Spinner — LLM component (only non-deterministic component) that turns user prompts into YAML workflows |
+| **Themis** | Titaness of divine law — deterministic component that parses, validates, and generates state machines from YAML. Contains GraphValidator internally |
+| **GraphValidator** | Internal class within Themis that checks DAG acyclicity and structural well-formedness |
 | **Lachesis** | Measurer — deterministic scheduler that executes the state machine |
 | **Penelope** | Weaver — deterministic consolidation component that diffs old and new state machines |
 | **Atropos** | Cutter — cleanup component that terminates hanging tasks and captures logs |
 | **LoopExecutor** | (v4) Standalone component managing loop iteration lifecycle, extracted from Lachesis for testability |
-| **State Machine** | Formal representation of the workflow as a directed acyclic graph (DAG) of tasks |
-| **YAML Artifact** | The workflow definition file generated by Clotho and consumed by Themis |
-| **Task** | A single unit of work in the workflow, with properties, agent assignment, and dependencies |
+| **State Machine** | Formal representation of the workflow as a directed acyclic graph (DAG) of tasks. Also referred to simply as the **workflow** |
+| **YAML Artifact** | The workflow definition file generated by Clotho and consumed by Themis. Exchangeable with **workflow** |
+| **Task** | A single unit of work in the workflow, with properties, agent assignment, and dependencies. Two types: `agent` (LLM agent) and `script` (direct shell command) |
 | **Agent** | An executor that can run a task (a process with a known command and environment) |
 | **Agent Registry** | A configuration file listing available agents with their interfaces |
 | **Consolidation** | The process of reconciling a new state machine with an ongoing execution |
