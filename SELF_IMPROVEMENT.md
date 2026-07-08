@@ -66,8 +66,9 @@ Once all phases are complete, the cycle becomes fully autonomous:
 3. Themis validates it
 4. Lachesis dispatches agent tasks to implement the feature
 5. LoopExecutor runs review cycles until APPROVED
-6. Moirai commits the code and moves the issue
-7. Loop — pick the next issue
+6. Each agent commits with its own name and `@namal.dev` email
+7. Moirai moves the issue on the project board *(requires Issue #10)*
+8. Loop — pick the next issue
 
 ## GitHub Project Board
 
