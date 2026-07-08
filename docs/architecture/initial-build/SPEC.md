@@ -1,11 +1,11 @@
 ---
 title: "Moirai — Specification Document"
 type: spec
-version: 4
+version: 5
 tags: [moirai, architecture, project, spec]
 created: 2026-07-08
 updated: 2026-07-08
-status: draft
+status: spec-complete
 repo: NamalD/moirai
 language: Python (PyYAML for YAML parsing, stdlib for everything else)
 ---
@@ -2011,10 +2011,80 @@ The following questions were resolved during the v5 spec cycle. All 13 original 
 
 ---
 
-## 23. Version History
+## 23. MVP Scope & Feature Prioritization
+
+The following defines the Minimum Viable Product (MVP) — the smallest set of features required for Moirai to be usable for building itself (the bootstrapping goal).
+
+### MVP Feature Set (Phase 1)
+
+| Feature | Priority | Rationale |
+|---------|:--------:|-----------|
+| Core data structures (§3) & protocols (§4) | P0 | Foundation — every component depends on these |
+| Themis (§7.2) — deterministic YAML validation + state machine generation | P0 | Required for any workflow execution. Contains GraphValidator internally |
+| YAML Workflow Schema (§5) | P0 | The format Clotho generates and Themis validates |
+| Lachesis (§7.4) — DAG scheduler with polling loop | P0 | The main execution engine |
+| Penelope (§7.5) — workflow consolidation | P0 | Required for mid-flight changes (hanging task recovery) |
+| Atropos (§7.6) — process cleanup | P0 | Required for task lifecycle management |
+| ProcessManager (§4.3) + subprocess dispatch model (§9) | P0 | How tasks actually run |
+| PersistenceBackend (§4.2) + file-based persistence (§18) | P0 | Required for scheduler state, crash recovery |
+| CLI (§7.8) — `moirai run` (ad-hoc) + `moirai status` + `moirai cancel` | P0 | Minimum user interface |
+| Clotho (§7.1) — LLM-powered YAML generation | P0 | The only way new workflows enter the system |
+| LoopExecutor (§4.7) + loop steps (§7.4 inner steps) | P0 | Required for dev-review-fix cycles |
+| Template system (§7.7) — basic `--template` support | P1 | Accelerates bootstrapping but not strictly required for first self-build |
+| Agent Registry (§8) — agent registration config | P1 | Required for any validation, but can start hardcoded |
+| Error recovery — retry loops, human intervention (§10) | P1 | Required for unattended operation |
+| LLMClient (§4.1) with provider adaptability | P1 | Required for Clotho function, but can start hardcoded |
+
+### Out of MVP Scope
+
+- Web UI / REST API (§7.8, §21 Q15) — deferred
+- Concurrent workflows (§21 Q12) — v2 feature
+- Nested loops (§21 Q17) — v2 feature
+- High-availability / Lachesis clustering — v3+
+- Remote persistence backends
+- `moirai update` (user-driven mid-flight change) — v2
+- Docker packaging / systemd units — implementation phase
+
+### Bootstrapping Goal
+
+The first real Moirai workflow should be a dev-review loop that uses Moirai to build Moirai itself. This means:
+1. A `dev-workflow` template (§7.7) that defines the standard development process
+2. Clotho generates YAML from the prompt "Add YAML artifact persistence to Moirai"
+3. Themis validates, Lachesis dispatches, Hephaestus (dev) and Themis (review) in a loop
+4. Atropos handles any hanging task cleanup
+
+## 24. Development Conventions
+
+The following conventions govern agent interactions with the Moirai project:
+
+### Version Tracking
+
+- **Every document change must be committed and pushed individually.** When Hephaestus updates the spec, commit and push. When Daedalus adds a comment response, commit and push. When Argus submits a review, commit and push.
+- **Work off `main` branch** for now. No feature branches — we're small enough that linear history is fine.
+- **Agents run sequentially**, not in parallel. This avoids merge conflicts and ensures each agent works off the latest state.
+- **Descriptive commit messages** — each commit message should reference what changed and why (e.g., "v5: Add template workflows (§7.7)" or "Argus review: testability gaps for loop steps").
+
+### File Locations
+
+- Specification: `docs/architecture/initial-build/SPEC.md`
+- Review comments: `docs/architecture/initial-build/comments.md`
+- Future architecture documents: `docs/architecture/<topic>/`
+- Implementation code: root of the repository (`moirai/`, `tests/`, etc.)
+
+### Workflow for Resuming
+
+1. Read `docs/architecture/initial-build/comments.md` to see the latest state.
+2. Read `docs/architecture/initial-build/SPEC.md` for the current spec.
+3. Address any unchecked comments, committing each batch of changes.
+4. Push after each commit.
+
+---
+
+## 25. Version History
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 5 | 2026-07-08 | Daedalus (architect) | **v5 — Addressed all 15 user design comments:** Themis made fully deterministic (GraphValidator internal class); PyYAML replaces hand-rolled parser; added TaskDef.type ("agent"/"script") for task types; added provider adaptability config (§13 clotho_provider, clotho_base_command); added §7.7 Template Workflows (parameterized YAML with Go-style substitution); added §7.8 CLI Surface (full command table, flags, review flow); added §11 Mermaid diagrams for all 6 execution flows; added §18.2 YAML Artifact Persistence (.moirai/ directory, versioned artifacts); added §23 MVP Scope & Feature Prioritization; added §24 Development Conventions (version tracking, file locations, resume workflow); resolved all 8 remaining open questions (§21 Q4, Q6, Q7, Q10, Q12, Q14, Q15, Q17); moved SPEC.md and comments.md to docs/architecture/initial-build/; checked off all 15 @user comments in comments.md. |
 | 4 | 2026-07-08 | Daedalus (architect) | **v4 — Applied all v3 review comments:** Extracted `LoopExecutor` protocol (§4.7) + component; extracted `check_terminate_on()` as pure function with whole-word (`\b\b`) matching; resolved Open Question #16 (iteration context passing via env vars `MOIRAI_LOOP_ITERATION`, `MOIRAI_PREV_OUTPUT`, `MOIRAI_PREV_OUTPUTS_*`); added `HumanDecision.CONTINUE` (§3, §10); changed `LoopTaskState.last_inner_output` to `last_inner_outputs: dict[str, str]` (§3); added `loop_failed_iterations`, `iteration_log`, `loop_timeout`, `loop_started_at` to `LoopTaskState` (§3); added `loop_timeout`, `max_concurrent_inner` to `LoopDef` (§3); unified inner step field name from `depends_on` to `deps` with backward-compat alias (§5); allowed empty `terminate_on` for counter-controlled loops (§6, §7.4); resolved §7.4/§7.5 contradiction — EXHAUSTED loops now allow `max_iterations` increase via Penelope (§7.5); clarified multi-leaf inner DAG termination check (all leaf outputs checked, any match wins) (§7.4); defined inner step failure cleanup (sibling steps cancelled via Atropos) (§7.4); added per-iteration log paths (`iter_{N}/`) (§9); added loop-specific structured log events (§15.1); added `active_loop_steps`, `current_loop_iterations` to health endpoint and metrics (§15.2, §15.4); added loop opaqueness test fixtures (§6, §19.1); defined `inner_execution_order` as cached topological sort from Lachesis (§7.4); documented crash recovery dependency on persisted `last_inner_outputs` (§7.4); added inner step agent validation to GraphValidator (§6); bumped persistence schema_version to 4 with `iteration_log`, `last_inner_outputs`, `loop_failed_iterations` (§18). |
 | 3 | 2026-07-08 | Daedalus (architect) | **Added loop step support:** Added `LoopStatus` enum, `LoopTaskState` dataclass, `LoopDef` dataclass (in §3). Added `LOOP_EXHAUSTED` to `FailureReason`. Updated `StateMachine` with `loop_tasks` field. Updated `ExecutionState` with `loop_tasks` tracking. Added loop step YAML schema example and rules table (in §5). Updated GraphValidator (§6) to treat loop steps as opaque nodes in the outer DAG — inner cycle detection bypassed for acyclicity check, cross-boundary dependency validation added. Updated Lachesis (§7.4) with loop step execution lifecycle — iteration management, terminate_on checking, iteration context passing, exhaustion escalation, and inner step hang detection. Updated Penelope (§7.5) with loop step consolidation rules. Updated human intervention protocol (§10) for loop exhausted scenarios. Added loop step execution flow diagram (new §11.6). Added loop exhaustion and inner step crash entries to error handling table (§12). Added `default_loop_max_iterations` to config (§13). Added `loop_iterations` and `loop_exhaustions` counters to metrics (§15.2). Updated persistence file format with `loop_tasks` section (§18). Added loop-related test fixtures to testing strategy (§19). Updated assumptions (§20) for loop step opacity and bounded iteration. Added loop step, loop iteration, terminate_on, max_iterations, LOOP_EXHAUSTED to glossary (§22). Added open questions for inter-iteration context passing and nested loops (§21). Bumped persistence schema_version to 3. |
 | 2 | 2026-07-08 | Daedalus (architect) | **Major update addressing all 4 agent reviews:** Added core data structures (§3), protocol interfaces (§4), YAML workflow schema (§5), GraphValidator component (§6), agent registry (§8), task dispatch/process model (§9), human intervention protocol (§10), secrets management (§14), observability (§15), resource management (§16), workflow cancellation (§17), persistence format & versioning (§18), testing strategy (§19), crash recovery (in §7.4), consolidation atomicity (in §7.5), retry backoff (in §7.1, §7.2), Clotho timeout recovery path (in §11.5), process-group cleanup (in §7.6), structured logging (in §15.1), metrics (in §15.2), audit trail (in §15.3), health checks (in §15.4), configuration validation (in §13), secrets management (§14), config validation (§13), no-op retry detection (in §7.1), modified-task compatibility matrix (in §7.5), concurrency config (in §7.4), graceful shutdown (in §7.4), persistence versioning (in §18), platform assumptions (in §20.12). Resolved 9 open questions. |
