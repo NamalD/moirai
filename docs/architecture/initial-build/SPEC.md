@@ -38,29 +38,33 @@ At a high level, Moirai:
 
 ```
 moirai/
-├── __init__.py            # Pipeline wiring, entry point
-├── __main__.py            # CLI entry point: python -m moirai (argparse-based CLI, see §7.8)
-├── cli.py                 # CLI command handlers (run, create template, list, status, cancel, review, update)
-├── config.py              # Config dataclass, env/file loading, validation
-├── types.py               # All shared data structures (dataclasses, TypedDicts)
-├── protocols.py           # All interface protocols (LLMClient, PersistenceBackend, etc.)
-├── clotho.py              # Clotho — LLM-powered YAML generation (only LLM component)
-├── themis.py              # Themis — deterministic YAML validation + state machine generation (contains GraphValidator as internal class)
-├── graph_validator.py     # (Deprecated in v5 — folded into themis.py as Themis._graph_validator)
-├── templates.py           # Template loading, parameter substitution, validation (see §7.7)
-├── lachesis.py            # Lachesis — deterministic scheduler
-├── loop_executor.py       # LoopExecutor — standalone loop iteration manager
-├── penelope.py            # Penelope — deterministic consolidation
-├── atropos.py             # Atropos — cleanup / process termination
-├── persistence/
-│   ├── __init__.py        # PersistenceBackend protocol + factory
-│   ├── file_backend.py    # File-based backend (atomic rename)
-│   └── memory_backend.py  # In-memory backend (testing, single-run)
-├── agents/
-│   ├── __init__.py        # Agent registry loading
-│   └── registry.py        # AgentDef dataclass, config file loading
-├── human_intervention.py  # Human decision polling, timeout, fallback
-├── logging_utils.py       # Structured JSON logging
+├── pyproject.toml            # Project metadata, dependency management (uv)
+├── README.md                 # Project overview and setup
+├── CONTRIBUTING.md           # Contribution guidelines
+├── moirai/
+│   ├── __init__.py           # Pipeline wiring, entry point
+│   ├── __main__.py           # CLI entry point: python -m moirai (argparse-based CLI, see §7.8)
+│   ├── cli.py                # CLI command handlers (run, create template, list, status, cancel, review, update)
+│   ├── config.py             # Config dataclass, env/file loading, validation
+│   ├── types.py              # All shared data structures (dataclasses, TypedDicts)
+│   ├── protocols.py          # All interface protocols (LLMClient, PersistenceBackend, etc.)
+│   ├── clotho.py             # Clotho — LLM-powered YAML generation (only LLM component)
+│   ├── themis.py             # Themis — deterministic YAML validation + state machine generation (contains GraphValidator as internal class)
+│   ├── graph_validator.py    # (Deprecated in v5 — folded into themis.py as Themis._graph_validator)
+│   ├── templates.py          # Template loading, parameter substitution, validation (see §7.7)
+│   ├── lachesis.py           # Lachesis — deterministic scheduler
+│   ├── loop_executor.py      # LoopExecutor — standalone loop iteration manager
+│   ├── penelope.py           # Penelope — deterministic consolidation
+│   ├── atropos.py            # Atropos — cleanup / process termination
+│   ├── persistence/
+│   │   ├── __init__.py       # PersistenceBackend protocol + factory
+│   │   ├── file_backend.py   # File-based backend (atomic rename)
+│   │   └── memory_backend.py # In-memory backend (testing, single-run)
+│   ├── agents/
+│   │   ├── __init__.py       # Agent registry loading
+│   │   └── registry.py       # AgentDef dataclass, config file loading
+│   ├── human_intervention.py # Human decision polling, timeout, fallback
+│   ├── logging_utils.py      # Structured JSON logging
 ├── metrics.py             # Internal counters/gauges
 └── audit.py               # Append-only audit log
 ```
