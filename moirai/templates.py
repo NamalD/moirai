@@ -197,12 +197,16 @@ def _resolve_params(template: TemplateDef, params: dict[str, str]) -> dict[str, 
 def _yaml_dquote_escape(value: str) -> str:
     """Escape a value for embedding inside a YAML double-quoted scalar.
 
-    Every placeholder in the templates this system ships (dev-workflow.yaml)
-    sits inside `"..."` in the raw template text (e.g. `"{{ .prompt }}"`), so
+    Most placeholders in the templates this system ships (dev-workflow.yaml)
+    sit inside `"..."` in the raw template text (e.g. `"{{ .prompt }}"`), so
     this is applied unconditionally to every substituted value rather than
     trying to detect quoting context. A value with none of these characters
-    passes through unchanged. Without this, a prompt containing a `"` (e.g.
-    `Fix the "TODO" in main.py`) breaks the surrounding YAML string.
+    passes through unchanged, so it's also safe for the rare unquoted
+    placeholder (e.g. `max_iterations: {{ .max_loop_attempts }}`), as long as
+    the substituted value itself contains none of these characters — true for
+    the numeric default and for any sane override. Without this escaping, a
+    prompt containing a `"` (e.g. `Fix the "TODO" in main.py`) would break the
+    surrounding YAML string.
     """
     value = value.replace("\\", "\\\\").replace('"', '\\"')
     value = value.replace("\r\n", "\\n").replace("\n", "\\n").replace("\r", "\\n")

@@ -1159,7 +1159,7 @@ tasks:
         deps: []
       - id: "review"
         agent: "themis-review"
-        command: "hermes --profile themis review --project {{ .project }}"
+        command: "hermes --profile themis chat -q \"Review the code changes just made in this project for correctness, quality, and spec compliance. Reply APPROVED if good to merge, or specific feedback if not.\""
         deps: ["fix"]
 
     - id: "deploy"

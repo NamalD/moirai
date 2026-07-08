@@ -48,5 +48,5 @@ workflow:
           deps: []
         - id: "review"
           agent: "themis-review"
-          command: "hermes --profile themis review --project {{ .project }}"
+          command: "hermes --profile themis chat -q \"Review the code changes just made in this project (working directory) for correctness, quality, and spec compliance against docs/architecture/initial-build/SPEC.md. Reply with the single word APPROVED if they're good to merge as-is, or specific actionable feedback describing exactly what needs to change if not.\""
           deps: ["fix"]
