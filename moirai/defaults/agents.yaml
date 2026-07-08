@@ -1,0 +1,28 @@
+# Moirai Agent Registry
+# Agents that Moirai dispatches tasks to.
+# The `command` field is the CLI invocation used by ProcessManager.
+
+agents:
+  - id: claude-dev
+    name: "Claude Code"
+    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks."
+    command: "claude --print"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 1
+    tags: [dev, implementation]
+
+  - id: themis-review
+    name: "Themis (Reviewer)"
+    description: "Quality reviewer — validates spec compliance, checks code quality."
+    command: "hermes --profile themis"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 1
+    tags: [review, quality]
+
+  - id: script-runner
+    name: "Script Runner"
+    description: "Runs shell scripts (build, deploy, test) without an LLM agent."
+    command: "/bin/bash"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 3
+    tags: [script, build, deploy]

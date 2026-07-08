@@ -1,0 +1,45 @@
+# Dev workflow template — standard implement + review + fix cycle
+# Uses Claude Code for implementation and Themis for review.
+name: "dev-workflow"
+description: "Standard dev workflow: implement with Claude Code, review with Themis, loop until approved"
+version: 1
+
+parameters:
+  - name: project
+    description: "Project directory path"
+    required: true
+  - name: prompt
+    description: "Task description for the implementation step"
+    required: true
+  - name: max_loop_attempts
+    description: "Maximum loop iterations for review-fix cycle"
+    default: 5
+
+workflow:
+  id: "{{ .project | slugify }}-{{ .prompt | slugify }}"
+  name: "{{ .project }}: {{ .prompt }}"
+  version: 1
+
+  tasks:
+    - id: "implement"
+      type: "agent"
+      agent: "claude-dev"
+      command: "claude --print --project {{ .project }} --prompt \"{{ .prompt }}\""
+      deps: []
+      max_retries: 2
+
+    - id: "review-loop"
+      type: loop
+      max_iterations: {{ .max_loop_attempts }}
+      terminate_on: "APPROVED"
+      deps: ["implement"]
+      steps:
+        - id: "review"
+          agent: "themis-review"
+          command: "hermes --profile themis review --project {{ .project }}"
+          deps: []
+        - id: "fix"
+          type: "agent"
+          agent: "claude-dev"
+          command: "claude --print --project {{ .project }} --prompt \"Address review feedback in {{ .project }}/review-output.md\""
+          deps: ["review"]
