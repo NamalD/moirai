@@ -34,29 +34,35 @@ Next feature from backlog starts
 
 ## The Bootstrap Build
 
-The first cycle focuses on getting Moirai to the point where it can build itself. Until Clotho is implemented, you provide the YAML manually:
+There's a bootstrapping paradox: RSI means Moirai *dispatching* tasks to build itself, but dispatch requires Themis + Lachesis + ProcessManager + Atropos to already exist. Those can't be built by a system that doesn't exist yet — so Phases 0-4 are built the normal way (you + Claude Code directly), with no Moirai scheduler involved at all. RSI proper doesn't start until that foundation is in place.
 
-1. Pick an issue from the backlog
-2. Write the YAML workflow (or use a template)
-3. `moirai run --template dev-workflow --yaml workflow.yaml`
-4. Moirai executes: implements the feature, tests it, reviews it, commits it
-5. After commit, Moirai can be triggered to pull the next issue and repeat
+### RSI Kickoff Criteria
+
+**Manual pre-RSI phases (0-4):** Project skeleton, Themis + GraphValidator, MemoryBackend, Lachesis + ProcessManager, and Atropos are built by hand, not dispatched. This is the minimum needed for Moirai to dispatch and safely clean up after a single task — LoopExecutor (5) and CLI + Templates (6) come later, *as RSI-dispatched work*, once this foundation exists.
+
+**Test bar before kickoff:** Each of Phases 0-4 needs a passing unit/integration test suite (per `SPEC.md §19`) before the first live dispatch — not just a manual smoke test. In particular, Atropos's kill path and Lachesis's dispatch/poll loop are the only safety net for an unattended, `bypassPermissions` agent; the first live run doesn't get a human checkpoint (see below), so this code needs to have been exercised before it's trusted with the real repo.
+
+**Kickoff moment:** RSI kicks off at the first live dispatch, *not* the first `moirai run --template` invocation — the CLI and template system (Phase 6) don't exist yet at this point. The first dispatch is invoked by a throwaway script (not part of the shipped `moirai/` package) that calls `Themis.parse()` on a hand-written, single-task YAML file (no `loop` step — `LoopExecutor` doesn't exist yet either) and hands the resulting `StateMachine` to `Lachesis` directly.
+
+**First task:** The first RSI-dispatched task builds Phase 5 (`LoopExecutor`), run by `claude-dev` with full `--permission-mode bypassPermissions` autonomy — including committing **and pushing straight to `main`**, identical to every subsequent run. There is no special human gate on this first run: if the Phase 0-4 test bar above is met, the first run is trusted the same as any later one.
+
+Once Phase 5 lands, the `dev-workflow` template's `review-loop` step becomes usable, so Phase 6 (CLI + Templates) can itself be built via a real dev-review-fix RSI cycle rather than a throwaway script.
 
 ## Implementation Phases
 
 The backlog is organized into phases. Each phase is a self-improvement step — Moirai implements one phase, then uses its new capabilities to implement the next.
 
-| Phase | What Moirai Gains | Self-Improvement Value |
-|:-----:|-------------------|----------------------|
-| 0 | Project skeleton, data structures | Foundation — nothing works without this |
-| 1 | Themis + GraphValidator | Can validate its own YAML workflows |
-| 2 | MemoryBackend | Can track its own state in-memory |
-| 3 | Lachesis + ProcessManager | Can actually execute tasks |
-| 4 | Atropos | Can clean up after itself |
-| 5 | LoopExecutor | Can run dev-review-fix cycles |
-| 6 | CLI + Templates | You can trigger self-improvement runs |
-| 7 | Penelope | (Deferred) Can handle mid-flight changes |
-| 8 | Clotho | (Deferred) Can write its own YAML — true autonomy |
+| Phase | What Moirai Gains | Self-Improvement Value | Built by |
+|:-----:|-------------------|----------------------|----------|
+| 0 | Project skeleton, data structures | Foundation — nothing works without this | Manual (pre-RSI) |
+| 1 | Themis + GraphValidator | Can validate its own YAML workflows | Manual (pre-RSI) |
+| 2 | MemoryBackend | Can track its own state in-memory | Manual (pre-RSI) |
+| 3 | Lachesis + ProcessManager | Can actually execute tasks | Manual (pre-RSI) |
+| 4 | Atropos | Can clean up after itself | Manual (pre-RSI) |
+| 5 | LoopExecutor | Can run dev-review-fix cycles | **RSI** — first live dispatch |
+| 6 | CLI + Templates | You can trigger self-improvement runs | RSI |
+| 7 | Penelope | (Deferred) Can handle mid-flight changes | RSI |
+| 8 | Clotho | (Deferred) Can write its own YAML — true autonomy | RSI |
 
 ## After Bootstrap
 
