@@ -1328,10 +1328,16 @@ When human intervention is required (Atropos cleanup, retry exhaustion, Clotho t
 
 ### 11.1 Normal Flow (Happy Path)
 
+```mermaid
+flowchart LR
+    A["User Prompt"] --> B["Clotho (LLM)"]
+    B --> C["YAML Artifact"]
+    C --> D["Themis\n(parse + validate + GraphValidator)"]
+    D --> E["StateMachine"]
+    E --> F["Lachesis (Scheduler)"]
+    F --> G["Execute Tasks"]
+    G --> H["Complete"]
 ```
-User Prompt → Clotho (LLM) → YAML → Themis → StateMachine → Lachesis → Execute Tasks
-```
-                                       (parse + validate + GraphValidator)
 
 1. **User submits** a natural-language prompt describing the workflow.
 2. **Clotho** (LLM, only non-deterministic component) generates a YAML workflow artifact.
@@ -1340,14 +1346,14 @@ User Prompt → Clotho (LLM) → YAML → Themis → StateMachine → Lachesis �
 5. **Lachesis** takes the state machine and begins executing tasks according to the DAG.
 6. On completion, Lachesis reports a successful execution summary.
 
-### 11.2 Validation Failure Loop (Clotho ↔ Themis ↔ GraphValidator Retry)
+### 11.2 Validation Failure Loop (Clotho ↔ Themis Retry)
 
-```
-Clotho (LLM) → YAML → Themis (deterministic, incl. GraphValidator) → Errors → Clotho (retry) → ...
-                                                                                   ↓
-                                                                            (passes eventually)
-                                                                                   ↓
-                                                                            Lachesis
+```mermaid
+flowchart LR
+    A["Clotho (LLM)"] --> B["YAML"]
+    B --> C["Themis\n(deterministic)"]
+    C -- "validation_errors" --> A
+    C -- "passes eventually" --> D["Lachesis"]
 ```
 
 1. **Clotho** generates YAML.
@@ -1360,23 +1366,18 @@ Clotho (LLM) → YAML → Themis (deterministic, incl. GraphValidator) → Error
 
 ### 11.3 Mid-Flight YAML Change (Task Hanging Recovery)
 
-```
-Lachesis detects hang → Clotho (LLM, with TaskInvestigator) → New YAML → Themis (deterministic → StateMachine)
-                                                                                                    ↓
-                                                                                             Penelope consolidates
-                                                                                                    ↓
-                                                                                             (can consolidate?)
-                                                                                              /            \
-                                                                                          Yes             No
-                                                                                           ↓               ↓
-                                                                                Update persistence    Clotho retries
-                                                                                Resume execution      (with consolidation errors)
-                                                                                                         ↓
-                                                                                                  (exhausted?)
-                                                                                                   /        \
-                                                                                               Yes         No
-                                                                                                ↓           ↓
-                                                                                         Human escalation  Clotho retries
+```mermaid
+flowchart TD
+    A["Lachesis detects hang"] --> B["Clotho (LLM)\n+ TaskInvestigator"]
+    B --> C["New YAML"]
+    C --> D["Themis (deterministic)"]
+    D --> E["Penelope\nconsolidates"]
+    E --> F{"Can\nconsolidate?"}
+    F -- "Yes" --> G["Update persistence\nResume execution"]
+    F -- "No" --> H["Clotho retries\n(with consolidation errors)"]
+    H --> I{"Exhausted?"}
+    I -- "Yes" --> J["Human escalation"]
+    I -- "No" --> B
 ```
 
 1. **Lachesis** detects a hanging task (crashes X times, timeout exceeded).
@@ -1396,8 +1397,14 @@ Lachesis detects hang → Clotho (LLM, with TaskInvestigator) → New YAML → T
 
 ### 11.4 Atropos Cleanup (Task Termination)
 
-```
-Lachesis detects hang → Atropos → Kill process group (SIGTERM → SIGKILL) → Capture logs → Archive → Request human intervention
+```mermaid
+flowchart LR
+    A["Lachesis detects hang"] --> B["Atropos"]
+    B --> C["SIGTERM → process group"]
+    C --> D["SIGKILL → process group"]
+    D --> E["Capture logs"]
+    E --> F["Archive"]
+    F --> G["Request human\nintervention"]
 ```
 
 1. **Lachesis** determines a task is hanging (crash limit exceeded or timeout exceeded).
@@ -1414,8 +1421,15 @@ Lachesis detects hang → Atropos → Kill process group (SIGTERM → SIGKILL) �
 
 ### 11.5 Clotho Timeout
 
-```
-Clotho runs → Timeout → Kill Clotho → Capture logs → Notify user → (if mid-flight recovery: escalate immediately to human)
+```mermaid
+flowchart LR
+    A["Clotho runs"] --> B{"Timeout?"}
+    B -- "Yes" --> C["Kill Clotho"]
+    C --> D["Capture logs"]
+    D --> E{"Mid-flight\nrecovery?"}
+    E -- "Yes" --> F["Escalate to human\nimmediately"]
+    E -- "No" --> G["Notify user\n(non-recoverable)"]
+    B -- "No" --> H["Complete"]
 ```
 
 1. **Clotho** is invoked (initial prompt or during a retry loop or mid-flight recovery).
@@ -1428,23 +1442,31 @@ Clotho runs → Timeout → Kill Clotho → Capture logs → Notify user → (if
 
 ### 11.6 Loop Step Execution Flow
 
+```mermaid
+flowchart TD
+    A["Lachesis delegates\nto LoopExecutor"] --> B["Iteration N"]
+    B --> C["Inner step 1"]
+    C --> D["Inner step 2"]
+    D --> E["Inner step ..."]
+    E --> F{"Check\nterminate_on?"}
+    F -- "Met" --> G["Loop COMPLETED"]
+    F -- "Not met" --> H{"current_iteration <\nmax_iterations?"}
+    H -- "Yes" --> I["Iteration N+1\n(context passed via env vars\nMOIRAI_LOOP_ITERATION,\nMOIRAI_PREV_OUTPUT,\nMOIRAI_PREV_OUTPUTS_*)"]
+    I --> B
+    H -- "No" --> J{"terminate_on\nempty?"}
+    J -- "Yes\n(counter loop)" --> K["Loop COMPLETED"]
+    J -- "No" --> L["Loop EXHAUSTED"]
+    L --> M["Human escalation"]
 ```
-Lachesis delegates to LoopExecutor → Iteration 1 → [inner step 1, inner step 2, ...] → Check terminate_on
-                                                                                                /            \
-                                                                                            Met           Not met
-                                                                                              ↓              ↓
-                                                                                   Loop COMPLETED    current_iteration < max_iterations?
-                                                                                                      /                \
-                                                                                                    Yes                No
-                                                                                                     ↓                  ↓
-                                                                                             Iteration 2          terminate_on empty?
-                                                                                             (context passed                          /        \
-                                                                                              via env vars:          Yes (counter-loop)    No (terminate_on set)
-                                                                                              MOIRAI_LOOP_ITERATION,    ↓                    ↓
-                                                                                              MOIRAI_PREV_OUTPUT,   Loop COMPLETED       Loop EXHAUSTED
-                                                                                              MOIRAI_PREV_OUTPUTS_*)                         ↓
-                                                                                                                                   Human escalation
-                                                                                                                                   or Clotho recovery
+
+**Inner step failure path:**
+
+```mermaid
+flowchart LR
+    A["Inner step fails"] --> B["Loop FAILED"]
+    B --> C["Atropos cleans up\nsibling steps"]
+    C --> D["Human escalation"]
+```
                                                                                                                                    (max_iterations increase allowed)
 ```
 
@@ -1790,7 +1812,46 @@ On startup, Lachesis compares the `schema_version` in the persistence file again
 
 ---
 
-## 19. Testing Strategy
+## 18.2 YAML Artifact Persistence (v5)
+
+Clotho-generated YAML workflow artifacts are persisted to disk for inspection, debugging, and audit purposes. Unlike the internal scheduler state (§18), YAML artifacts are human-readable workflow definitions.
+
+### Storage Layout
+
+YAML artifacts are stored in a `.moirai/` directory within the target project path:
+
+```
+{project}/.moirai/
+├── templates/                    # Project-specific templates (see §7.7)
+│   └── dev-workflow.yaml
+└── artifacts/                    # Clotho-generated YAML workflows
+    └── {workflow_id}/
+        ├── v1.yaml               # Original YAML artifact (initial generation)
+        ├── v2.yaml               # First revision (e.g., after retry or consolidation)
+        └── v3.yaml               # Second revision
+```
+
+### Versioning
+
+Each time a new YAML is generated (initial generation, validation retry, or mid-flight consolidation), the artifact is saved as a new version file:
+- `v1.yaml` — Initial Clotho output
+- `v{N}.yaml` — Subsequent revisions (N increments for each new generation)
+- `current.yaml` — Symlink or copy of the most recent version for quick access
+
+### Cross-Component Reference
+
+Components may reference YAML files by path instead of passing raw strings:
+- **Clotho** writes YAML to `{project}/.moirai/artifacts/{workflow_id}/v{N}.yaml` and returns the file path.
+- **Themis** reads the YAML from the file path for validation.
+- **Penelope** reads old and new YAML versions from their respective paths during consolidation.
+- In-memory string passing is still the default for testability — file-based references are an implementation detail of the persistence layer.
+
+### Assumptions
+
+- The `.moirai/` directory is created automatically on first workflow run.
+- Old artifacts are retained indefinitely (no automatic cleanup) — operators may archive or prune manually.
+- `current.yaml` always points to the latest version.
+- File permissions: `0600` for artifact files, `0700` for directories.
 
 ### 19.1 Unit Testing
 
