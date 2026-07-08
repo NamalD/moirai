@@ -33,13 +33,20 @@ workflow:
       max_iterations: {{ .max_loop_attempts }}
       terminate_on: "APPROVED"
       deps: ["implement"]
+      # "review" must be the leaf step (deps: ["fix"], nothing depends on it):
+      # LoopExecutor checks terminate_on against leaf-step output only, so the
+      # step that renders the actual verdict has to be the one with no
+      # dependents. Reviewer feedback reaches "fix" via the MOIRAI_PREV_OUTPUT
+      # env var LoopExecutor injects (SPEC.md §7.4 item 6) -- never shell-
+      # interpolated into the command string, since that's untrusted content
+      # from an external tool and could otherwise inject shell syntax.
       steps:
-        - id: "review"
-          agent: "themis-review"
-          command: "hermes --profile themis review --project {{ .project }}"
-          deps: []
         - id: "fix"
           type: "agent"
           agent: "claude-dev"
-          command: "claude --print --permission-mode bypassPermissions \"Address review feedback in review-output.md\""
-          deps: ["review"]
+          command: "claude --print --permission-mode bypassPermissions \"Check the MOIRAI_PREV_OUTPUT and MOIRAI_LOOP_ITERATION environment variables (run printenv yourself to see them). If MOIRAI_PREV_OUTPUT is set, it contains feedback from the previous review pass -- address it. If not set, this is the first pass: review your own recent implementation and make only necessary corrections, or none if it already looks solid.\""
+          deps: []
+        - id: "review"
+          agent: "themis-review"
+          command: "hermes --profile themis review --project {{ .project }}"
+          deps: ["fix"]

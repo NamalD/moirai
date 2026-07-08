@@ -1148,16 +1148,19 @@ tasks:
     max_iterations: {{ .max_loop_attempts }}
     terminate_on: "APPROVED"
     deps: ["implement"]
+    # "review" is the leaf step (deps: ["fix"], nothing depends on it) since
+    # LoopExecutor checks terminate_on against leaf-step output only -- the
+    # step rendering the actual verdict must be the one with no dependents.
     steps:
-      - id: "review"
-        agent: "themis-review"
-        command: "hermes --profile themis review --project {{ .project }}"
-        deps: []
       - id: "fix"
         type: "agent"
         agent: "claude-dev"
-        command: "claude --print --permission-mode bypassPermissions \"Address review feedback\""
-        deps: ["review"]
+        command: "claude --print --permission-mode bypassPermissions \"Check MOIRAI_PREV_OUTPUT (run printenv yourself) and address any previous review feedback\""
+        deps: []
+      - id: "review"
+        agent: "themis-review"
+        command: "hermes --profile themis review --project {{ .project }}"
+        deps: ["fix"]
 
     - id: "deploy"
       type: "script"
