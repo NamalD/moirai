@@ -26,3 +26,11 @@ agents:
     work_dir: "{{project}}"
     max_concurrent_tasks: 3
     tags: [script, build, deploy]
+
+  - id: daedalus
+    name: "Daedalus (Architect)"
+    description: "Architect and spec writer — designs data structures, protocols, and workflows. Reviews architecture decisions."
+    command: "hermes --profile daedalus"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 1
+    tags: [architect, design, spec]
