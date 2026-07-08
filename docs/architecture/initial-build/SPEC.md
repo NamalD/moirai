@@ -2082,13 +2082,16 @@ The following conventions govern agent interactions with the Moirai project:
 - **Every document change must be committed and pushed individually.** When Hephaestus updates the spec, commit and push. When Daedalus adds a comment response, commit and push. When Argus submits a review, commit and push.
 - **Work off `main` branch** for now. No feature branches — we're small enough that linear history is fine.
 - **Agents run sequentially**, not in parallel. This avoids merge conflicts and ensures each agent works off the latest state.
-- **Agent git authorship.** Every agent sets their name and the `@namal.dev` email domain before committing:
-  ```
-  export GIT_AUTHOR_NAME="Hephaestus"
-  export GIT_AUTHOR_EMAIL="hephaestus@namal.dev"
-  export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
-  export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-  ```
+- **Agent git authorship (baked into profiles).** Each Hermes profile sets its own git author name and `@namal.dev` email automatically via `terminal.shell_init_files`:
+  | Profile | Git Author |
+  |---------|-----------|
+  | `daedalus` / `default` | Daedalus <daedalus@namal.dev> |
+  | `hephaestus` | Hephaestus <hephaestus@namal.dev> |
+  | `themis` | Themis <themis@namal.dev> |
+  | `argus` | Argus <argus@namal.dev> |
+  | `atlas` | Atlas <atlas@namal.dev> |
+  
+  Agents do not need to set these manually — the env vars are exported at shell init via scripts in `~/.hermes/scripts/set-git-author-*.sh`. If you're adding a new agent profile, create the corresponding script and add it to the profile's `terminal.shell_init_files`.
 - **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
   ```
   [Phase 1] Implement YAML schema validation in Themis (#3)

@@ -52,13 +52,17 @@ All agents working on this project follow these rules:
 1. **Every document change is committed and pushed individually.** Spec update → commit + push. Comment added → commit + push.
 2. **Work off `main` branch.** No feature branches for doc changes.
 3. **Agents run sequentially.** Avoids merge conflicts and ensures each agent works off the latest state.
-4. **Agent git authorship.** Every agent sets their name and the `@namal.dev` email domain before committing:
-   ```bash
-   export GIT_AUTHOR_NAME="Hephaestus"
-   export GIT_AUTHOR_EMAIL="hephaestus@namal.dev"
-   export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
-   export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-   ```
+4. **Agent git authorship (baked into profiles).** Each Hermes profile sets its own git author automatically via `terminal.shell_init_files`. Agents do not need to remember to set these manually:
+
+   | Profile | Git Author |
+   |---------|-----------|
+   | `daedalus` / `default` | Daedalus <daedalus@namal.dev> |
+   | `hephaestus` | Hephaestus <hephaestus@namal.dev> |
+   | `themis` | Themis <themis@namal.dev> |
+   | `argus` | Argus <argus@namal.dev> |
+   | `atlas` | Atlas <atlas@namal.dev> |
+
+   Scripts live at `~/.hermes/scripts/set-git-author-*.sh` and are referenced in each profile's `terminal.shell_init_files` in their `config.yaml`.
 5. **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
    ```
    [Phase 1] Implement YAML schema validation in Themis (#3)
