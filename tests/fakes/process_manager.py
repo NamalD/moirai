@@ -19,6 +19,7 @@ class FakeProcessManager:
         self._next_pid = 1000
         self._exit_codes: dict[int, Optional[int]] = {}
         self._killed: set[int] = set()
+        self._outputs: dict[int, tuple[str, str]] = {}
 
     def spawn(
         self, task_def: TaskDef, agent_def: AgentDef, work_dir: str, log_dir: str
@@ -50,12 +51,17 @@ class FakeProcessManager:
         self.signals_received.setdefault(process.pid, []).append(sig)
 
     def read_output(self, process: ProcessInfo) -> tuple[str, str]:
+        if process.pid in self._outputs:
+            return self._outputs[process.pid]
         return f"stdout for {process.pid}", f"stderr for {process.pid}"
 
     # ─── Test control surface ───────────────────────────────────────
 
     def complete(self, pid: int, exit_code: int) -> None:
         self._exit_codes[pid] = exit_code
+
+    def set_output(self, pid: int, stdout: str, stderr: str = "") -> None:
+        self._outputs[pid] = (stdout, stderr)
 
     def mark_killed(self, pid: int) -> None:
         """Simulate a successful SIGTERM/SIGKILL — process now reports exited."""

@@ -8,6 +8,7 @@ from moirai.types import (
     AgentDef,
     FailureReason,
     LoopDef,
+    LoopStatus,
     SchedulerConfig,
     StateMachine,
     TaskDef,
@@ -51,19 +52,6 @@ def sm_linear() -> StateMachine:
         dependencies={"a": [], "b": ["a"]},
         entry_points=["a"],
     )
-
-
-def test_rejects_state_machine_with_loop_tasks():
-    sm = StateMachine(
-        workflow_id="wf-1",
-        version=1,
-        tasks={},
-        loop_tasks={"loop-1": LoopDef(id="loop-1")},
-        dependencies={"loop-1": []},
-        entry_points=["loop-1"],
-    )
-    with pytest.raises(NotImplementedError):
-        make_lachesis(sm)
 
 
 def test_dispatches_entry_point_first():
@@ -232,3 +220,161 @@ def test_run_stops_when_blocked_with_nothing_running_or_ready():
     assert log.outcome == "failed"
     assert persistence.get_task("wf-1", "a").status == TaskStatus.FAILED
     assert persistence.get_task("wf-1", "b").status == TaskStatus.PENDING
+
+
+# ─── Loop step integration (Phase 5, SPEC.md §7.4 items 1-9) ───────────
+
+
+def auto_complete_spawn(pm, outputs_by_task_id=None):
+    """Wrap pm.spawn so every spawned process auto-completes with exit 0,
+    optionally with a queued stdout string per task id (FIFO across
+    iterations for steps re-run each loop iteration).
+    """
+    outputs_by_task_id = outputs_by_task_id or {}
+    original_spawn = pm.spawn
+
+    def spawn(task_def, agent_def, work_dir, log_dir):
+        info = original_spawn(task_def, agent_def, work_dir, log_dir)
+        queue = outputs_by_task_id.get(task_def.id)
+        output = queue.pop(0) if queue else ""
+        pm.set_output(info.pid, output, "")
+        pm.complete(info.pid, 0)
+        return info
+
+    pm.spawn = spawn
+
+
+def sm_with_loop(terminate_on="APPROVED", max_iterations=3, downstream=False) -> StateMachine:
+    implement = TaskDef(id="implement", agent="agent-a", command="echo implement", deps=[])
+    review = TaskDef(id="review", agent="agent-a", command="echo review", deps=["implement"])
+    loop = LoopDef(
+        id="dev-review",
+        max_iterations=max_iterations,
+        terminate_on=terminate_on,
+        inner_steps=[implement, review],
+    )
+    tasks = {}
+    dependencies = {"dev-review": []}
+    entry_points = ["dev-review"]
+    if downstream:
+        deploy = TaskDef(id="deploy", agent="agent-a", command="echo deploy", deps=["dev-review"])
+        tasks["deploy"] = deploy
+        dependencies["deploy"] = ["dev-review"]
+    return StateMachine(
+        workflow_id="wf-1",
+        version=1,
+        tasks=tasks,
+        loop_tasks={"dev-review": loop},
+        dependencies=dependencies,
+        entry_points=entry_points,
+    )
+
+
+def test_loop_step_completes_when_terminate_on_met_on_first_iteration():
+    sm = sm_with_loop()
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm, {"review": ["APPROVED"]})
+
+    log = lachesis.run()
+
+    assert log.outcome == "success"
+    assert persistence.get_task("wf-1", "dev-review").status == TaskStatus.COMPLETED
+    assert lachesis._loop_states["dev-review"].loop_status == LoopStatus.COMPLETED
+    assert lachesis._loop_states["dev-review"].current_iteration == 1
+
+
+def test_loop_step_iterates_until_terminate_on_met():
+    sm = sm_with_loop(max_iterations=5)
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm, {"review": ["REJECTED", "REJECTED", "APPROVED"]})
+
+    log = lachesis.run()
+
+    assert log.outcome == "success"
+    assert persistence.get_task("wf-1", "dev-review").status == TaskStatus.COMPLETED
+    assert lachesis._loop_states["dev-review"].current_iteration == 3
+
+
+def test_loop_step_whole_word_matching_rejects_unapproved():
+    sm = sm_with_loop(max_iterations=5)
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm, {"review": ["UNAPPROVED", "APPROVED"]})
+
+    log = lachesis.run()
+
+    assert log.outcome == "success"
+    assert lachesis._loop_states["dev-review"].current_iteration == 2
+
+
+def test_loop_step_exhaustion_marks_failed_and_escalates():
+    sm = sm_with_loop(max_iterations=2)
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm, {"review": ["REJECTED", "REJECTED"]})
+
+    log = lachesis.run()
+
+    assert log.outcome == "failed"
+    state = persistence.get_task("wf-1", "dev-review")
+    assert state.status == TaskStatus.FAILED
+    assert state.failure_reason == FailureReason.LOOP_EXHAUSTED
+    assert lachesis._loop_states["dev-review"].loop_status == LoopStatus.EXHAUSTED
+    assert len(lachesis._human_notifier.requests) == 1
+    assert lachesis._human_notifier.requests[0]["task_id"] == "dev-review"
+
+
+def test_counter_controlled_loop_completes_after_max_iterations():
+    sm = sm_with_loop(terminate_on="", max_iterations=2)
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm)
+
+    log = lachesis.run()
+
+    assert log.outcome == "success"
+    assert persistence.get_task("wf-1", "dev-review").status == TaskStatus.COMPLETED
+    assert lachesis._loop_states["dev-review"].loop_status == LoopStatus.COMPLETED
+    assert lachesis._loop_states["dev-review"].current_iteration == 2
+
+
+def test_loop_step_inner_failure_marks_loop_failed_and_escalates():
+    implement = TaskDef(id="implement", agent="agent-a", command="echo implement", deps=[], max_retries=0)
+    review = TaskDef(id="review", agent="agent-a", command="echo review", deps=["implement"])
+    loop = LoopDef(id="dev-review", max_iterations=3, terminate_on="APPROVED", inner_steps=[implement, review])
+    sm = StateMachine(
+        workflow_id="wf-1",
+        version=1,
+        tasks={},
+        loop_tasks={"dev-review": loop},
+        dependencies={"dev-review": []},
+        entry_points=["dev-review"],
+    )
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+
+    original_spawn = pm.spawn
+
+    def spawn(task_def, agent_def, work_dir, log_dir):
+        info = original_spawn(task_def, agent_def, work_dir, log_dir)
+        if task_def.id == "implement":
+            pm.complete(info.pid, 1)  # crashes immediately, no retries left
+        return info
+
+    pm.spawn = spawn
+
+    log = lachesis.run()
+
+    assert log.outcome == "failed"
+    state = persistence.get_task("wf-1", "dev-review")
+    assert state.status == TaskStatus.FAILED
+    assert state.failure_reason == FailureReason.CRASH_LIMIT_EXCEEDED
+    assert len(lachesis._human_notifier.requests) == 1
+
+
+def test_downstream_task_becomes_ready_after_loop_step_completes():
+    sm = sm_with_loop(downstream=True)
+    lachesis, persistence, pm, atropos, clock = make_lachesis(sm)
+    auto_complete_spawn(pm, {"review": ["APPROVED"]})
+
+    log = lachesis.run()
+
+    assert log.outcome == "success"
+    assert persistence.get_task("wf-1", "dev-review").status == TaskStatus.COMPLETED
+    assert persistence.get_task("wf-1", "deploy").status == TaskStatus.COMPLETED

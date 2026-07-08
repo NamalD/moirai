@@ -1,16 +1,16 @@
 """Lachesis — deterministic scheduler (SPEC.md §7.4, §9).
 
-Scope note: loop steps (LoopDef) are delegated to LoopExecutor per §4.7 /
-§7.4, which is Phase 5 — not yet implemented. Lachesis here handles the
-plain-task DAG scheduling loop only; a StateMachine containing loop_tasks
-is rejected up front with a clear NotImplementedError rather than silently
-mishandled.
+Loop steps (LoopDef) are opaque single nodes in the outer DAG — Lachesis
+delegates all inner iteration management to LoopExecutor (§4.7) and only
+tracks the loop step's outer TaskState (RUNNING/COMPLETED/FAILED) plus its
+LoopTaskState (§7.4 items 1-9).
 """
 
 import os
 import signal as signal_module
 from typing import Optional, Protocol
 
+from moirai.loop_executor import LoopExecutor
 from moirai.protocols import HumanNotifier, PersistenceBackend, ProcessManager, TimeProvider
 from moirai.types import (
     AgentDef,
@@ -18,6 +18,9 @@ from moirai.types import (
     ExecutionLog,
     ExecutionState,
     FailureReason,
+    LoopIterationResult,
+    LoopStatus,
+    LoopTaskState,
     ProcessInfo,
     SchedulerConfig,
     StateMachine,
@@ -64,12 +67,8 @@ class Lachesis:
         config: Optional[SchedulerConfig] = None,
         default_work_dir: str = ".",
         log_dir: str = "/tmp/moirai-logs",
+        loop_executor: Optional[LoopExecutor] = None,
     ) -> None:
-        if state_machine.loop_tasks:
-            raise NotImplementedError(
-                "Lachesis (Phase 3) does not yet support loop steps — "
-                "that's LoopExecutor's job (Phase 5), not implemented yet."
-            )
         self._sm = state_machine
         self._persistence = persistence
         self._process_manager = process_manager
@@ -80,8 +79,12 @@ class Lachesis:
         self._config = config or SchedulerConfig()
         self._default_work_dir = default_work_dir
         self._log_dir = os.path.join(log_dir, state_machine.workflow_id)
+        self._loop_executor = loop_executor or LoopExecutor(
+            agents=agents, atropos=atropos, default_work_dir=default_work_dir, log_dir=self._log_dir
+        )
 
         self._running: dict[str, ProcessInfo] = {}
+        self._loop_states: dict[str, LoopTaskState] = {}
         self._events: list[TaskEvent] = []
         self._shutdown_requested = False
         self._cancelled = False
@@ -139,15 +142,22 @@ class Lachesis:
     # ─── Internals ───────────────────────────────────────────────────
 
     def _initialize_state(self) -> None:
-        for task_id in self._sm.tasks:
+        for task_id in list(self._sm.tasks) + list(self._sm.loop_tasks):
             if self._persistence.get_task(self._sm.workflow_id, task_id) is None:
                 self._persistence.set_task(
                     self._sm.workflow_id, task_id, TaskState(task_id=task_id)
                 )
+        for task_id, loop_def in self._sm.loop_tasks.items():
+            if task_id not in self._loop_states:
+                self._loop_states[task_id] = LoopTaskState(
+                    task_id=task_id,
+                    max_iterations=loop_def.max_iterations,
+                    terminate_on=loop_def.terminate_on,
+                )
 
     def _ready_tasks(self) -> list[str]:
         ready = []
-        for task_id in self._sm.tasks:
+        for task_id in list(self._sm.tasks) + list(self._sm.loop_tasks):
             state = self._persistence.get_task(self._sm.workflow_id, task_id)
             if state.status != TaskStatus.PENDING:
                 continue
@@ -166,6 +176,10 @@ class Lachesis:
             self._dispatch(ready.pop(0))
 
     def _dispatch(self, task_id: str) -> None:
+        if task_id in self._sm.loop_tasks:
+            self._dispatch_loop(task_id)
+            return
+
         task_def = self._sm.tasks[task_id]
         agent_def = self._agents[task_def.agent]
         work_dir = agent_def.work_dir or self._default_work_dir
@@ -180,6 +194,92 @@ class Lachesis:
         self._persistence.set_task(self._sm.workflow_id, task_id, state)
         self._running[task_id] = process_info
         self._emit_event(task_id, TaskStatus.PENDING, TaskStatus.RUNNING)
+
+    # ─── Loop step dispatch (SPEC.md §7.4 items 1-9) ────────────────
+
+    def _dispatch_loop(self, task_id: str) -> None:
+        """Run a loop step to completion, delegating iteration-by-iteration
+        to LoopExecutor. Loop steps are opaque single nodes to the outer
+        DAG, so this blocks until the loop step reaches a terminal state.
+
+        Known limitation (tracked in issue #11): this blocks Lachesis's
+        entire outer polling loop for as long as the loop step runs — other
+        ready tasks cannot dispatch, and other running tasks aren't polled,
+        until this returns. Harmless for the one real workflow this system
+        runs today (dev-workflow.yaml's implement -> review-loop chain has
+        nothing to parallelize), but violates §7.4's non-blocking polling
+        model for a DAG with independent parallel branches.
+        """
+        loop_def = self._sm.loop_tasks[task_id]
+        loop_state = self._loop_states[task_id]
+
+        state = self._persistence.get_task(self._sm.workflow_id, task_id)
+        state.status = TaskStatus.RUNNING
+        state.attempts += 1
+        state.started_at = self._time_provider.now()
+        self._persistence.set_task(self._sm.workflow_id, task_id, state)
+        self._emit_event(task_id, TaskStatus.PENDING, TaskStatus.RUNNING)
+
+        while True:
+            result = self._loop_executor.execute_iteration(
+                loop_state, loop_def, self._process_manager, self._time_provider
+            )
+            if result.failure_reason is not None:
+                self._finish_loop_failed(task_id, result)
+                return
+            if result.terminate_on_met:
+                loop_state.loop_status = LoopStatus.COMPLETED
+                self._finish_loop_completed(task_id)
+                return
+            if loop_state.current_iteration >= loop_def.max_iterations:
+                if not loop_def.terminate_on:
+                    loop_state.loop_status = LoopStatus.COMPLETED
+                    self._finish_loop_completed(task_id)
+                else:
+                    loop_state.loop_status = LoopStatus.EXHAUSTED
+                    self._finish_loop_exhausted(task_id, loop_state)
+                return
+            # terminate_on not met and iterations remain -> loop back for the next one.
+
+    def _finish_loop_completed(self, task_id: str) -> None:
+        state = self._persistence.get_task(self._sm.workflow_id, task_id)
+        state.status = TaskStatus.COMPLETED
+        state.completed_at = self._time_provider.now()
+        self._persistence.set_task(self._sm.workflow_id, task_id, state)
+        self._emit_event(task_id, TaskStatus.RUNNING, TaskStatus.COMPLETED)
+
+    def _finish_loop_failed(self, task_id: str, result: LoopIterationResult) -> None:
+        state = self._persistence.get_task(self._sm.workflow_id, task_id)
+        state.status = TaskStatus.FAILED
+        state.failure_reason = result.failure_reason
+        state.completed_at = self._time_provider.now()
+        state.error_message = (
+            f"loop step failed: {result.failure_reason.name}; failed_steps={result.failed_steps}"
+        )
+        self._persistence.set_task(self._sm.workflow_id, task_id, state)
+        self._emit_event(task_id, TaskStatus.RUNNING, TaskStatus.FAILED, details=state.error_message)
+        self._human_notifier.request_intervention(
+            workflow_id=self._sm.workflow_id,
+            task_id=task_id,
+            reason=f"Loop step '{task_id}' failed: {result.failure_reason.name}",
+        )
+
+    def _finish_loop_exhausted(self, task_id: str, loop_state: LoopTaskState) -> None:
+        state = self._persistence.get_task(self._sm.workflow_id, task_id)
+        state.status = TaskStatus.FAILED
+        state.failure_reason = FailureReason.LOOP_EXHAUSTED
+        state.completed_at = self._time_provider.now()
+        state.error_message = f"loop exhausted after {loop_state.current_iteration} iterations"
+        self._persistence.set_task(self._sm.workflow_id, task_id, state)
+        self._emit_event(task_id, TaskStatus.RUNNING, TaskStatus.FAILED, details=state.error_message)
+        self._human_notifier.request_intervention(
+            workflow_id=self._sm.workflow_id,
+            task_id=task_id,
+            reason=(
+                f"Loop step '{task_id}' exhausted max_iterations={loop_state.max_iterations} "
+                f"without meeting terminate_on={loop_state.terminate_on!r}"
+            ),
+        )
 
     def _poll_running(self) -> None:
         for task_id, process_info in list(self._running.items()):
@@ -236,7 +336,7 @@ class Lachesis:
         )
 
     def _do_cancel(self) -> None:
-        for task_id in self._sm.tasks:
+        for task_id in list(self._sm.tasks) + list(self._sm.loop_tasks):
             state = self._persistence.get_task(self._sm.workflow_id, task_id)
             if state.status in (TaskStatus.PENDING, TaskStatus.READY):
                 state.status = TaskStatus.CANCELLED
@@ -265,7 +365,7 @@ class Lachesis:
     def _finalize_execution_log(self, start_time: float) -> ExecutionLog:
         tasks = {
             task_id: self._persistence.get_task(self._sm.workflow_id, task_id)
-            for task_id in self._sm.tasks
+            for task_id in list(self._sm.tasks) + list(self._sm.loop_tasks)
         }
         if self._cancelled:
             outcome = "cancelled"
@@ -281,6 +381,7 @@ class Lachesis:
                 workflow_id=self._sm.workflow_id,
                 tasks=tasks,
                 current_sm_version=self._sm.version,
+                loop_tasks=self._loop_states,
             )
         )
         return ExecutionLog(
