@@ -139,6 +139,36 @@ workflow:
     assert (project_dir / "marker.txt").read_text().strip() == "raw"
 
 
+def test_run_builtin_dev_workflow_template_validates(tmp_path, capsys):
+    # Regression test for the bug fixed in 3c62b3d: the built-in
+    # dev-workflow.yaml has an *unquoted* placeholder
+    # (`max_iterations: {{ .max_loop_attempts }}`) alongside its quoted
+    # ones, and a "review" command that must match the real hermes CLI.
+    # --review exercises the full instantiate -> Themis.validate path
+    # against the real built-in template and agent registry without
+    # spawning claude/hermes.
+    project_dir = tmp_path / "project"
+    project_dir.mkdir()
+
+    exit_code = cli.main(
+        [
+            "run",
+            "--template",
+            "dev-workflow",
+            "--project",
+            str(project_dir),
+            "--param",
+            "prompt=say hi",
+            "--review",
+        ]
+    )
+
+    assert exit_code == 0
+    out = capsys.readouterr().out
+    assert "implement" in out
+    assert "review-loop" in out
+
+
 def test_run_requires_template_yaml_or_prompt(capsys):
     exit_code = cli.main(["run"])
     assert exit_code == 2
