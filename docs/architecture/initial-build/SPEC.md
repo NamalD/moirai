@@ -2051,11 +2051,25 @@ The following defines the Minimum Viable Product (MVP) — the smallest set of f
 - `moirai update` (user-driven mid-flight change) — v2
 - Docker packaging / systemd units — implementation phase
 
+### Implementation Order (MVP)
+
+| Phase | Component | Rationale |
+|:-----:|-----------|-----------|
+| 0 | **Skeleton** — `pyproject.toml`, `types.py`, `protocols.py`, `__init__.py` | Foundation — every component depends on these |
+| 1 | **Themis + GraphValidator** | Pure logic, easiest to test, gives core data flow. YAML in → state machine out |
+| 2 | **In-memory PersistenceBackend** (`MemoryBackend`) | ~40-line dict wrapper that Lachesis requires |
+| 3 | **Lachesis + ProcessManager** | The main scheduler loop — ready-queue, dispatch, poll, complete. Makes the system actually run tasks |
+| 4 | **Atropos** | Process cleanup — `os.killpg`, log capture, mark failed. Needed alongside Lachesis for lifecycle management |
+| 5 | **LoopExecutor** | Loop iteration management for dev-review-fix cycle templates |
+| 6 | **CLI + Templates** | `moirai run --template` — the user interface |
+| 7 | **Penelope** | Consolidation deferred — bootstrap build doesn't need mid-flight changes |
+| 8 | **Clotho stub** | Placeholder returned — deferred until Moirai builds its own YAML generator |
+
 ### Bootstrapping Goal
 
 The first real Moirai workflow should be a dev-review loop that uses Moirai to build Moirai itself. This means:
 1. A `dev-workflow` template (§7.7) that defines the standard development process
-2. Clotho generates YAML from the prompt "Add YAML artifact persistence to Moirai"
+2. The user provides the YAML (Clotho is stubbed for MVP)
 3. Themis validates, Lachesis dispatches, Hephaestus (dev) and Themis (review) in a loop
 4. Atropos handles any hanging task cleanup
 
