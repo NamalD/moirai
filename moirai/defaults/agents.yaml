@@ -5,8 +5,8 @@
 agents:
   - id: claude-dev
     name: "Claude Code"
-    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks."
-    command: "claude --print"
+    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks. Runs unattended (--permission-mode bypassPermissions), so work_dir must not expose secrets and ProcessManager must not pass its environment through unfiltered — see SPEC.md §9."
+    command: "claude --print --permission-mode bypassPermissions"
     work_dir: "{{project}}"
     max_concurrent_tasks: 1
     tags: [dev, implementation]

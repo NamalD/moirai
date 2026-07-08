@@ -24,7 +24,7 @@ workflow:
     - id: "implement"
       type: "agent"
       agent: "claude-dev"
-      command: "claude --print --project {{ .project }} --prompt \"{{ .prompt }}\""
+      command: "claude --print --permission-mode bypassPermissions \"{{ .prompt }}\""
       deps: []
       max_retries: 2
 
@@ -41,5 +41,5 @@ workflow:
         - id: "fix"
           type: "agent"
           agent: "claude-dev"
-          command: "claude --print --project {{ .project }} --prompt \"Address review feedback in {{ .project }}/review-output.md\""
+          command: "claude --print --permission-mode bypassPermissions \"Address review feedback in review-output.md\""
           deps: ["review"]
