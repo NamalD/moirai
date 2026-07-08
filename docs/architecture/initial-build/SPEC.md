@@ -2038,6 +2038,8 @@ The following defines the Minimum Viable Product (MVP) — the smallest set of f
 | Template system (§7.7) — basic `--template` support | P1 | Accelerates bootstrapping but not strictly required for first self-build |
 | Agent Registry (§8) — agent registration config | P1 | Required for any validation, but can start hardcoded |
 | Error recovery — retry loops, human intervention (§10) | P1 | Required for unattended operation |
+| Human intervention protocol (§10) | P2 | Stripped for MVP — user is at keyboard, re-run manually. No HumanNotifier, no polling, no decision channel. MVP exits on failure with error message |
+| Circuit breaker / rate limiter (§4.1) | P2 | Stripped for MVP — simple retry-with-backoff only |
 | LLMClient (§4.1) with provider adaptability | P1 | Required for Clotho function, but can start hardcoded |
 
 ### Out of MVP Scope
