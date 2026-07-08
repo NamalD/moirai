@@ -1,7 +1,7 @@
 ---
 title: "Moirai — Specification Document"
 type: spec
-version: 2
+version: 4
 tags: [moirai, architecture, project, spec]
 created: 2026-07-08
 updated: 2026-07-08
@@ -47,6 +47,7 @@ moirai/
 ├── themis.py              # Themis — LLM-powered semantic validation
 ├── graph_validator.py     # Deterministic DAG acyclicity & structural checks
 ├── lachesis.py            # Lachesis — deterministic scheduler
+├── loop_executor.py       # LoopExecutor — standalone loop iteration manager
 ├── penelope.py            # Penelope — deterministic consolidation
 ├── atropos.py             # Atropos — cleanup / process termination
 ├── persistence/
@@ -86,10 +87,11 @@ class TaskStatus(Enum):
     SKIPPED    = auto()
 
 class HumanDecision(Enum):
-    RETRY   = auto()   # Re-attempt the failed/hanging task
-    SKIP    = auto()   # Mark task as skipped, continue workflow
-    ABORT   = auto()   # Abort the entire workflow
-    RESTART = auto()   # Restart the workflow from scratch
+    RETRY    = auto()   # Re-attempt the failed/hanging task
+    SKIP     = auto()   # Mark task as skipped, continue workflow
+    ABORT    = auto()   # Abort the entire workflow
+    RESTART  = auto()   # Restart the workflow from scratch
+    CONTINUE = auto()   # (v4) Accept current loop output as meeting terminate_on condition
 
 class FailureReason(Enum):
     TIMEOUT_EXCEEDED = auto()
@@ -97,6 +99,15 @@ class FailureReason(Enum):
     CONSOLIDATION_FAILURE = auto()
     CLOTHO_TIMEOUT = auto()
     USER_ABORT = auto()
+    LOOP_EXHAUSTED = auto()  # Loop step hit max_iterations without termination
+
+class LoopStatus(Enum):
+    """Status of a loop step's internal execution."""
+    ITERATING = auto()       # Running inner steps
+    COMPLETED = auto()       # terminate_on condition met (or max_iterations reached with no terminate_on set)
+    EXHAUSTED = auto()       # max_iterations reached without termination (only when terminate_on is set and unmet)
+    PENDING   = auto()       # Not yet started
+    CANCELLED = auto()
 
 class CleanupOutcome(Enum):
     KILLED          = auto()   # SIGTERM succeeded
@@ -138,6 +149,22 @@ class TaskDef:
     outputs: list[str] = field(default_factory=list)
 
 @dataclass
+class LoopDef:
+    """A loop step definition within a workflow YAML artifact.
+
+    A loop step is a node in the outer DAG that internally contains a
+    sub-graph of steps executed in a bounded iteration loop.
+    """
+    id: str                              # Stable task identifier
+    type: Literal["loop"] = "loop"       # Discriminator from TaskDef
+    max_iterations: int = 5              # Maximum number of iterations
+    terminate_on: str = ""               # (v4) Condition string checked after each iteration. Empty = counter-controlled loop (runs exactly max_iterations, reports COMPLETED)
+    deps: list[str] = field(default_factory=list)  # Outer DAG dependencies (opaque)
+    inner_steps: list[TaskDef] = field(default_factory=list)  # Inner step definitions
+    loop_timeout: Optional[int] = None   # (v4) Wall-clock timeout for entire loop step in seconds. Default: max_iterations * max(inner_step_timeout) * len(inner_steps)
+    max_concurrent_inner: int = 1        # (v4) Max concurrent inner steps within a loop iteration. Default 1 = sequential. Independent from outer pool.
+
+@dataclass
 class ValidationError:
     """Structured error from validation (Themis or GraphValidator)."""
     field: str                           # Dot-separated field path, e.g. "tasks.build.command"
@@ -155,7 +182,8 @@ class StateMachine:
     """
     workflow_id: str                     # Unique workflow identifier
     version: int                         # Monotonically increasing per workflow
-    tasks: dict[str, TaskDef]            # task_id → TaskDef (node map)
+    tasks: dict[str, TaskDef]            # task_id → TaskDef (regular task node map)
+    loop_tasks: dict[str, LoopDef]       # task_id → LoopDef (loop step node map)
     dependencies: dict[str, list[str]]   # task_id → list of dependency task_ids
     entry_points: list[str]              # Tasks with no dependencies (zero in-degree)
     metadata: dict[str, str] = field(default_factory=dict)
@@ -175,10 +203,34 @@ class TaskState:
     error_message: Optional[str] = None
 
 @dataclass
+class LoopTaskState:
+    """Execution state for a loop step — tracks inner iteration progress.
+
+    A loop step node in the outer DAG contains an internal sub-graph of steps.
+    The outer DAG sees the loop step as a single opaque node; the inner steps
+    execute per iteration.
+    """
+    task_id: str
+    status: TaskStatus = TaskStatus.PENDING
+    loop_status: LoopStatus = LoopStatus.PENDING
+    current_iteration: int = 0           # 1-based, resets on PENDING
+    max_iterations: int = 5              # Hard limit from step definition
+    terminate_on: str = ""               # Condition string (empty = counter-controlled loop)
+    last_inner_outputs: dict[str, str] = field(default_factory=dict)  # (v4) step_id → output from last completed iteration (replaces single last_inner_output)
+    last_inner_output: Optional[str] = None  # (v4) Deprecated alias — kept for persistence compatibility, derived from last_inner_outputs values
+    inner_task_states: dict[str, TaskState] = field(default_factory=dict)
+    inner_execution_order: list[str] = field(default_factory=list)  # (v4) Cached topological order computed by Lachesis at first dispatch
+    loop_timeout: Optional[int] = None   # (v4) Wall-clock deadline (absolute Unix timestamp) for entire loop
+    loop_started_at: Optional[float] = None  # (v4) Unix timestamp when loop first entered ITERATING
+    loop_failed_iterations: int = 0      # (v4) Cumulative count of iterations that failed (complements current_iteration)
+    iteration_log: list[dict] = field(default_factory=list)  # (v4) Persistent per-iteration record
+
+@dataclass
 class ExecutionState:
     """Snapshot of all task states in a workflow at a point in time."""
     workflow_id: str
-    tasks: dict[str, TaskState]          # task_id → TaskState
+    tasks: dict[str, TaskState]          # task_id → TaskState (regular tasks)
+    loop_tasks: dict[str, LoopTaskState] = field(default_factory=dict)  # task_id → LoopTaskState
     current_sm_version: int
 
 @dataclass
@@ -449,6 +501,73 @@ class TaskInvestigator(Protocol):
     def get_workflow_context(self) -> dict: ...
 ```
 
+### 4.7 LoopExecutor Protocol (v4)
+
+```python
+class LoopExecutor(Protocol):
+    """Standalone loop iteration manager — extracted from Lachesis for testability.
+
+    LoopExecutor handles the inner iteration lifecycle of a loop step.
+    It receives loop state and process-management infrastructure, and
+    returns iteration outcomes. Lachesis delegates loop step management
+    to this component rather than embedding it inline.
+    """
+
+    def execute_iteration(
+        self,
+        loop_state: LoopTaskState,
+        loop_def: LoopDef,
+        process_manager: ProcessManager,
+        time_provider: TimeProvider,
+    ) -> LoopIterationResult:
+        """Execute one iteration of inner steps.
+
+        Spawns inner steps, polls for completion, handles inner step
+        failures, checks terminate_on, and returns the iteration result.
+        Inner step hang detection is handled here, not in Lachesis's
+        main polling loop.
+        """
+        ...
+
+    def check_terminate_on(
+        self,
+        output: str,
+        condition: str,
+    ) -> bool:
+        """Pure function: does 'output' match 'condition'?
+
+        Uses whole-word matching (\\bCONDITION\\b) rather than bare
+        substring matching to prevent false positives.
+        Extracted as a pure, independently testable function.
+        """
+        ...
+
+    def build_iteration_context(
+        self,
+        previous_outputs: dict[str, str],
+        current_iteration: int,
+    ) -> dict[str, str]:
+        """Build context dict for the next iteration from previous outputs.
+
+        Returns a dict of environment variable overrides:
+        - MOIRAI_LOOP_ITERATION=N
+        - MOIRAI_PREV_OUTPUT=<final step output>
+        - MOIRAI_PREV_OUTPUTS_<step_id>=<output> for each step
+        """
+        ...
+
+
+@dataclass
+class LoopIterationResult:
+    """Outcome of a single loop iteration."""
+    completed: bool                       # True if all inner steps completed (regardless of terminate_on)
+    terminate_on_met: bool                # True if terminate_on condition matched
+    inner_outputs: dict[str, str]         # step_id → captured stdout
+    final_output: str                     # Concatenated output of leaf node(s)
+    failed_steps: list[str]               # Inner step IDs that failed
+    failure_reason: Optional[FailureReason] = None
+```
+
 ---
 
 ## 5. YAML Workflow Schema
@@ -508,6 +627,22 @@ workflow:
       max_retries: 1
       inputs:
         data_dir: "/tmp/transformed"
+
+    # Loop step example: dev -> review -> fix -> review until approved
+    - id: "feature-work"
+      type: loop
+      max_iterations: 5
+      terminate_on: "APPROVED"
+      deps: []
+      steps:
+        - id: "implement"
+          agent: "etl-agent"
+          command: "./scripts/implement.sh"
+          deps: []
+        - id: "review"
+          agent: "ml-agent"
+          command: "./scripts/code-review.sh"
+          deps: ["implement"]
 ```
 
 ### Schema Rules
@@ -526,10 +661,30 @@ workflow:
 | `workflow.tasks[].id` | task | yes | string | Stable task identifier |
 | `workflow.tasks[].agent` | task | yes | string | References an agent ID |
 | `workflow.tasks[].command` | task | yes | string | Shell command to execute |
-| `workflow.tasks[].deps` | task | yes | list of strings | Task IDs this task depends on |
+| `workflow.tasks[].deps` | task | yes | list of strings | Task IDs this task depends on (unified field name — used for both outer and inner steps) |
 | `workflow.tasks[].timeout` | task | no (default: 3600) | int | Max seconds before deemed hanging |
 | `workflow.tasks[].max_retries` | task | no (default: 3) | int | Auto-retry count on crash |
 | `workflow.tasks[].inputs` | task | no | dict | Key-value input parameters |
+
+**Loop step fields** (when `workflow.tasks[].type` is `"loop"`):
+
+| Field | Parent | Required | Type | Description |
+|-------|--------|----------|------|-------------|
+| `workflow.tasks[].type` | task | no (default: `"task"`) | string | Step type: `"task"` for regular steps, `"loop"` for loop steps |
+| `workflow.tasks[].max_iterations` | loop task | no (default: 5) | int | Maximum number of iterations before exhaustion |
+| `workflow.tasks[].terminate_on` | loop task | no (default: `""`) | string | (v4) String to check in the leaf inner step(s) output. Empty string = counter-controlled loop (runs exactly max_iterations, reports COMPLETED). Non-empty = whole-word matching (`\bcondition\b`) against leaf step outputs. |
+| `workflow.tasks[].loop_timeout` | loop task | no | int | (v4) Wall-clock timeout for entire loop step in seconds. Default: computed as max_iterations * max(inner_step_timeout) * len(inner_steps) |
+| `workflow.tasks[].max_concurrent_inner` | loop task | no (default: 1) | int | (v4) Max concurrent inner steps within a single iteration. Default 1 = sequential. Independent from outer scheduler pool. |
+| `workflow.tasks[].steps` | loop task | yes | list | Inner step definitions (same schema as outer `tasks[]`, with `deps` scoped within the loop) |
+| `workflow.tasks[].steps[].id` | inner step | yes | string | Inner step identifier (scoped to the loop) |
+| `workflow.tasks[].steps[].agent` | inner step | yes | string | References an agent ID |
+| `workflow.tasks[].steps[].command` | inner step | yes | string | Shell command to execute |
+| `workflow.tasks[].steps[].deps` | inner step | yes | list of strings | (v4) Unified field name `deps` (was `depends_on`). Inner step IDs this step depends on (scoped within the loop) |
+| `workflow.tasks[].steps[].timeout` | inner step | no (default: 3600) | int | Max seconds before deemed hanging |
+| `workflow.tasks[].steps[].max_retries` | inner step | no (default: 3) | int | Auto-retry count on crash |
+| `workflow.tasks[].steps[].inputs` | inner step | no | dict | Key-value input parameters |
+
+**Note (v4):** The inner step `deps` field was renamed from `depends_on` (v3) to `deps` for consistency with outer tasks. The YAML parser accepts both `deps` and `depends_on` for backward compatibility with v3 workflows, mapping them to the same `TaskDef.deps` field.
 
 ---
 
@@ -544,8 +699,9 @@ workflow:
 **Inputs:**
 | Input | Type | Description |
 |-------|------|-------------|
-| `tasks` | `dict[str, TaskDef]` | Parsed task definitions |
-| `dependencies` | `dict[str, list[str]]` | Dependency adjacency lists |
+| `tasks` | `dict[str, TaskDef]` | Parsed regular task definitions |
+| `loop_tasks` | `dict[str, LoopDef]` | Parsed loop step definitions |
+| `dependencies` | `dict[str, list[str]]` | Dependency adjacency lists (outer DAG only) |
 
 **Outputs:**
 | Output | Type | Description |
@@ -555,18 +711,32 @@ workflow:
 | `is_valid` | `bool` | Whether the graph passed all checks |
 
 **Validation checks:**
-1. **Acyclicity** — DFS-based cycle detection (back-edge check). Guarantees the dependency graph is a DAG.
-2. **All task references valid** — every `deps` entry references an existing task ID.
-3. **Agent references valid** — every task's `agent` field references an existing agent ID.
+1. **Acyclicity** — DFS-based cycle detection (back-edge check). Guarantees the dependency graph is a DAG. Loop steps are treated as **single opaque nodes** — their inner sub-graphs are NOT traversed during outer cycle detection.
+2. **All task references valid** — every `deps` entry references an existing task ID (across both regular and loop tasks).
+3. **Agent references valid** — every task's `agent` field references an existing agent ID. This applies to both regular tasks AND loop inner steps (which are `TaskDef` objects and must reference valid agents).
 4. **No orphan tasks** — every task is reachable from at least one entry point (transitive closure).
 5. **Single root** — there is at least one task with zero dependencies (entry point).
 6. **Topological ordering** — tasks can be topologically sorted (produce execution order).
 7. **Well-formed transitions** — no self-loops, no duplicate dependency entries.
+8. **Loop step inner validation** — for each loop step:
+   - Inner `deps` references must be scoped within that loop's inner steps only (no cross-boundary references).
+   - Inner steps must form a connected sub-graph reachable from at least one inner entry point.
+   - At least one inner step must be defined (non-empty `steps`).
+   - `max_iterations` must be positive (>= 1).
+   - `terminate_on` may be empty (v4: counter-controlled loop). If non-empty, it should be a meaningful string.
+9. **No cross-boundary dependencies** — no outer task may depend on an inner step ID, and no inner step may depend on an outer task ID.
+
+**Loop opaqueness invariants (v4 — explicit test fixtures):**
+- An outer cycle *through* a loop step (outer A → loop L → outer B, where outer B depends on outer A) IS detected by outer cycle detection.
+- An inner cycle (inner step X → inner step Y → inner step X) does NOT cause an outer acyclicity failure.
+- Cross-boundary dependency references (outer task depending on inner step ID, inner step depending on outer task ID) are caught and rejected.
+- These invariants are tested via table-driven GraphValidator test fixtures (see §19.1).
 
 **Assumptions:**
 - The YAML has already been structurally parsed (basic YAML → dict conversion) before reaching GraphValidator.
 - Themis has already verified semantic correctness (agent names match real agents, commands are plausible).
 - GraphValidator outputs a `StateMachine` with `entry_points`, `dependencies`, and a topologically sorted task order.
+- Loop steps are opaque to the outer DAG — GraphValidator does NOT analyze the internal structure of loops for cycle detection in the outer graph.
 
 ---
 
@@ -648,12 +818,15 @@ class HangingTaskInfo:
 - Input parameter references (e.g., `{{ .inputs.xxx }}`) reference valid input keys.
 - The workflow description matches the user's intent.
 - No ambiguous or contradictory task definitions.
+- Loop step `terminate_on` conditions are semantically meaningful.
+- Loop step `max_iterations` is a reasonable bound given the workflow intent.
 
 **Themis does NOT handle (deterministic checks delegated to GraphValidator):**
 - DAG acyclicity (cycle detection) — see §6 GraphValidator.
 - Dependency graph structure / topological ordering.
 - Missing task ID references (handled structurally).
 - State machine well-formedness (handled structurally).
+- Loop step inner dependency scoping (handled structurally).
 
 **Assumptions:**
 - Themis has access to a configured `LLMClient` (same or different from Clotho's).
@@ -719,6 +892,7 @@ class SchedulerConfig:
 - Persist all state changes durably using `PersistenceBackend.atomic_transaction()`.
 - Install a SIGTERM handler for graceful shutdown: stop accepting new tasks, wait for running tasks up to `graceful_shutdown_timeout`, checkpoint execution state, exit cleanly.
 - Support workflow cancellation (user-initiated abort via signal or CLI command): mark all pending/ready tasks as CANCELLED, kill running tasks via Atropos, generate final execution log.
+- **Execute loop steps** — when a loop step becomes READY, delegate to `LoopExecutor` for iteration management (see LoopExecutor Protocol §4.7 and Loop Step Execution below).
 
 **Polling model:** Lachesis uses a non-blocking event loop:
 ```
@@ -728,7 +902,7 @@ loop:
     if exit_code is not None:
       handle_completion(task_id, exit_code)
   
-  # Check for newly ready tasks
+  # Check for newly ready tasks (including loop steps)
   ready = find_ready_tasks(execution_state, state_machine)
   while ready and running_count < max_concurrent_tasks:
     task = ready.pop(0)
@@ -740,24 +914,87 @@ loop:
   time_provider.sleep(poll_interval)
 ```
 
+**Loop Step Execution:**
+
+When Lachesis encounters a loop step (identified by the presence of a `LoopDef` in the state machine), it delegates iteration management to the **LoopExecutor** (§4.7). The lifecycle is:
+
+1. **Initialization:** On first dispatch, Lachesis creates a `LoopTaskState` with `loop_status = PENDING`, `current_iteration = 0`, and `loop_started_at = None`. The outer DAG treats the loop step as a single RUNNING task — it appears as one node in the task queue.
+
+2. **Iteration start (via LoopExecutor):** The executor increments `current_iteration`, sets `loop_status = ITERATING`, and records `loop_started_at` on first iteration. Inner steps are initialized as PENDING based on the inner dependency graph. The first iteration begins with inner steps that have no `deps` (inner entry points).
+
+3. **Inner step dispatch (via LoopExecutor):** Inner steps are dispatched as subprocesses following the same process model as outer tasks (§9). They are tracked in `LoopTaskState.inner_task_states`. Inner step concurrency is governed by `LoopDef.max_concurrent_inner` (default 1 = sequential), which is independent of the global `max_concurrent_tasks` limit — loops do not consume outer scheduler concurrency slots. Completion of inner steps is checked via `ProcessManager.poll()`.
+
+4. **Inner step hang detection (via LoopExecutor):** Inner steps are polled through LoopExecutor, NOT through Lachesis's main polling loop. This avoids double-handling with outer hang detection. If an inner step hangs:
+   - Atropos is invoked with the **inner step's scoped task_id** (`{loop_step_id}.{inner_step_id}`) and the inner step's ProcessInfo.
+   - All other RUNNING inner steps in the same iteration are passed to Atropos for cleanup.
+   - All PENDING inner steps in the same iteration are marked CANCELLED.
+   - The loop step is marked FAILED.
+   - `loop_failed_iterations` is NOT incremented (the iteration is considered incomplete).
+
+5. **Iteration completion (via LoopExecutor):** When all inner steps in the current iteration complete:
+   - Collect outputs of all **leaf steps** (steps with no dependents in the inner graph).
+   - If `terminate_on` is non-empty: check if ANY leaf step's output contains the `terminate_on` condition using whole-word matching (`\bcondition\b`).
+   - **If terminate_on is met:** Set `loop_status = COMPLETED`, mark the loop step as COMPLETED in the outer DAG. Downstream tasks that depend on this loop step become READY.
+   - **If terminate_on is NOT met and current_iteration < max_iterations:** Increment `current_iteration` and re-run all inner steps. Context from the previous iteration is passed via `LoopExecutor.build_iteration_context()` (see §4.7).
+   - **If terminate_on is NOT met and current_iteration >= max_iterations:** Set `loop_status = EXHAUSTED`, mark the loop step as FAILED with `failure_reason = LOOP_EXHAUSTED`. Invoke the escalation path.
+   - **If terminate_on is empty (counter-controlled loop):** After each iteration, increment `current_iteration`. When `current_iteration >= max_iterations`, set `loop_status = COMPLETED` (not EXHAUSTED). The loop step is marked COMPLETED in the outer DAG.
+
+6. **Context passing between iterations (v4 — resolved):** The `LoopExecutor.build_iteration_context()` method constructs the context for the next iteration:
+   - Environment variables set on each inner step:
+     - `MOIRAI_LOOP_ITERATION=N` — current iteration number (1-based)
+     - `MOIRAI_PREV_OUTPUT=<output>` — concatenated output of all leaf steps from the previous iteration
+     - `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>` — per-step output from the previous iteration (e.g., `MOIRAI_PREV_OUTPUTS_REVIEW="APPROVED"`)
+   - These env vars are injected into each inner step's environment before spawning.
+   - `LoopTaskState.last_inner_outputs` (dict[str, str] mapping step_id → captured stdout) is the authoritative source and is persisted across iterations.
+   - A structured log event `loop_context_passed` records the iteration number, context keys, and output checksum for observability.
+
+7. **Loop timeout checking (v4):** At the start of each iteration, LoopExecutor checks `loop_timeout` against wall-clock time:
+   - `loop_timeout` in `LoopTaskState` is computed as an absolute Unix timestamp deadline on first entry to ITERATING.
+   - If `time_provider.now() > loop_timeout`, the loop is marked FAILED with `failure_reason = TIMEOUT_EXCEEDED`.
+   - The `loop_timeout` is derived from `LoopDef.loop_timeout` (if set) or computed as `max_iterations * max(inner_step_timeout) * len(inner_steps)`.
+
+8. **Per-iteration logging (v4):** Each iteration appends an entry to `LoopTaskState.iteration_log`:
+   ```json
+   {
+     "iteration": 3,
+     "started_at": 1712345678.0,
+     "completed_at": 1712345978.0,
+     "inner_steps": {
+       "implement": {"status": "COMPLETED", "exit_code": 0},
+       "review": {"status": "COMPLETED", "exit_code": 0}
+     },
+     "terminate_on_met": true,
+     "final_output_truncated": "APPROVED — ..."
+   }
+   ```
+
+9. **Escalation on exhaustion:** When `max_iterations` is exhausted without meeting `terminate_on`, Lachesis:
+   - Captures the last iteration's inner step outputs (including the leaf step outputs showing the failure to meet the condition).
+   - Marks the loop step as FAILED.
+   - Invokes human intervention via `HumanNotifier` with the loop step ID, the `terminate_on` condition, the number of iterations attempted, the `iteration_log`, and the captured outputs.
+   - If mid-flight recovery is enabled, Clotho may be invoked (with a bounded investigator) to generate a new YAML that modifies the loop step. **Penelope allows `max_iterations` increase for EXHAUSTED loops** (v4: see §7.5 exception). Changes to `terminate_on` or inner step structure for EXHAUSTED loops are NOT allowed via Clotho recovery — those require human intervention.
+
 **Hang detection mechanism:**
 - Crash count is tracked in `TaskState.attempts` and persisted.
 - Each time a task crashes (non-zero exit code), attempts is incremented. If `attempts > task_def.max_retries`, the task is marked hanging and Atropos is invoked.
 - Runtime is tracked by comparing `TaskState.started_at` against `TimeProvider.now()`. If `now - started_at > task_def.timeout`, the task is marked hanging.
 - Hang checks run at `hang_check_interval_seconds` intervals (configurable, default 5s).
+- Inner step hang detection is handled by LoopExecutor, not Lachesis's main polling loop, to prevent double-handling. LoopExecutor invokes Atropos for the inner step with its scoped task_id.
 
 **Crash recovery:** If Lachesis itself crashes mid-workflow, on restart:
 1. Load `ExecutionState` from persistence.
 2. Tasks in `RUNNING` state are treated with caution — Atropos is invoked to clean them up (they may still be alive or already dead).
-3. Tasks in `PENDING`/`READY` state are preserved as-is.
-4. The state machine is reloaded and execution resumes from the current state.
-5. A recovery audit entry is created.
+3. Loop tasks in `ITERATING` state are reset to the start of the iteration indicated by `current_iteration`. All inner task state is discarded. The `current_iteration` counter is preserved (not decremented), so iteration N is re-attempted from scratch. `LoopTaskState.last_inner_outputs` (persisted) provides context for the re-started iteration. Loop tasks in `EXHAUSTED` state are preserved as-is.
+4. Tasks in `PENDING`/`READY` state are preserved as-is.
+5. The state machine is reloaded and execution resumes from the current state.
+6. A recovery audit entry is created.
 
 **Assumptions:**
 - The persistence layer provides atomic read/write operations for task state.
 - Tasks report their status back through process exit code (captured by ProcessManager).
 - Lachesis runs as a long-lived process (or is restarted with state recovery as described above).
 - The state machine's DAG is traversed based on topological order (entry points first, then tasks whose dependencies are satisfied).
+- Loop steps are opaque to the outer DAG — Lachesis sees one node but delegates iteration management to LoopExecutor.
 
 ---
 
@@ -796,6 +1033,11 @@ loop:
 | **Unchanged task** | Preserve current state (PENDING → PENDING, RUNNING → RUNNING, etc.) |
 | **Modified task — same agent, same command shape** | Compatible — state transfers as: PENDING → PENDING, READY → READY, RUNNING → reset to PENDING (too risky to keep running with new params), COMPLETED → stay COMPLETED if the change is backward-compatible (e.g., new timeout), otherwise fail |
 | **Modified task — different agent or different command** | Incompatible — treated as removed (old) + new (new). If the old task was RUNNING, Atropos cancels it first. If COMPLETED, consolidation fails |
+| **Loop step changed — inner steps modified** | If PENDING or ITERATING: cancel all running inner steps via Atropos, reset to PENDING, re-validate inner steps via GraphValidator. If COMPLETED: fail — cannot change a loop whose execution has finished. **If EXHAUSTED: max_iterations increase ONLY is allowed** (v4 exception — see below). All other changes to EXHAUSTED loops fail. |
+| **Loop step changed — terminate_on modified** | If PENDING or ITERATING: compatible (condition changes take effect next iteration). Loop is NOT reset to PENDING — the current iteration continues with the new condition. If COMPLETED or EXHAUSTED: fail (unless EXHAUSTED with only max_iterations increase, see above). |
+| **Loop step changed — max_iterations increased only** | If EXHAUSTED: **Allowed** (v4 exception). The loop is reset to ITERATING with current_iteration preserved. Termination condition and inner step definitions must be identical. This enables the Clotho-recovery path for exhausted loops. If PENDING or ITERATING: compatible (cap is raised or kept). |
+| **New loop step** | Added as PENDING with LoopTaskState |
+| **Task converted to/from loop step** | Treated as removed + new — old state must not be COMPLETED or RUNNING |
 
 **Atomicity / Rollback:** Penelope operates as a two-phase process:
 1. **Validation phase** — Compute the entire `ConsolidationPlan` in memory. Check all rules. If any rule fails (e.g., completed task removed), return `can_consolidate=False` with errors. No persistence changes are made during this phase.
@@ -818,7 +1060,7 @@ loop:
 **Inputs:**
 | Input | Type | Description |
 |-------|------|-------------|
-| `task_id` | `str` | The identifier of the hanging task |
+| `task_id` | `str` | The identifier of the hanging task (for inner step hangs, this is the scoped ID `{loop_id}.{inner_step_id}`) |
 | `task_process_info` | `ProcessInfo` | Process handle, PID, PGID, start time, stdout/stderr paths |
 | `failure_reason` | `FailureReason` | Why the task was deemed hanging |
 | `config` | `CleanupConfig` | Timeout for kill signals, log retention policy, retry settings |
@@ -848,7 +1090,7 @@ loop:
 - The task is running as a child process in a process group that the scheduler can signal.
 - Tasks are spawned with `os.setpgid()` to place them in their own process group.
 - Logs are written to a known location (convention: `{log_dir}/{workflow_id}/{task_id}/{timestamp}.stdout` and `.stderr`).
-- Human intervention means a person picks up the failure report and decides how to proceed (retry, skip, abort) — polled via `HumanNotifier.poll_decision()`.
+- Human intervention means a person picks up the failure report and decides how to proceed (retry, skip, abort, continue) — polled via `HumanNotifier.poll_decision()`.
 - Atropos does NOT attempt to fix the task — it only cleans up and escalates.
 - Atropos has a retry loop for cleanup failures (up to `kill_retry_count` retries on failed kill), after which it logs a warning and still escalates.
 
@@ -895,6 +1137,10 @@ The registry is passed as `known_agents` to Themis and used by Lachesis to resol
 6. If exit code is non-zero and `attempts < max_retries`, the task is re-queued as READY.
 7. If exit code is non-zero and `attempts >= max_retries`, the task is marked hanging → Atropos is invoked.
 
+**Log path convention for loop inner steps (v4):** Inner step logs include the iteration number to prevent log overwriting across iterations:
+`{log_dir}/{workflow_id}/{loop_step_id}/iter_{N}/{inner_step_id}/{timestamp}.stdout`
+`{log_dir}/{workflow_id}/{loop_step_id}/iter_{N}/{inner_step_id}/{timestamp}.stderr`
+
 **Status reporting contract:**
 - Exit code 0 → task completed successfully.
 - Non-zero exit code → task failed. The stdout/stderr logs contain error details.
@@ -905,13 +1151,13 @@ The registry is passed as `known_agents` to Themis and used by Lachesis to resol
 
 ## 10. Human Intervention Protocol
 
-When human intervention is required (Atropos cleanup, retry exhaustion, Clotho timeout during recovery):
+When human intervention is required (Atropos cleanup, retry exhaustion, Clotho timeout during recovery, loop step max_iterations exhausted):
 
 1. **Notification:** `HumanNotifier.request_intervention()` is called with workflow ID, task ID (if applicable), reason, and log archive path.
 2. **Decision channel:** The human makes a decision by writing to a known file (`{moirai_state_dir}/{workflow_id}/human_decision.json`). The decision schema:
    ```json
    {
-     "decision": "retry" | "skip" | "abort" | "restart",
+     "decision": "retry" | "skip" | "abort" | "restart" | "continue",
      "request_id": "uuid-of-request",
      "reason": "Optional explanation from the human",
      "timestamp": "2026-07-08T12:00:00Z"
@@ -920,10 +1166,11 @@ When human intervention is required (Atropos cleanup, retry exhaustion, Clotho t
 3. **Polling:** `HumanNotifier.poll_decision()` checks the decision file at the configured polling interval. The default timeout is 24 hours (`human_response_timeout`).
 4. **Timeout:** If no decision is received within `human_response_timeout`, the system auto-aborts the workflow (fallback: `HumanDecision.ABORT`).
 5. **Resume:** Once a decision is received:
-   - `RETRY` → The failed task is reset to READY and re-dispatched (capped at one human-forced retry before re-escalating).
-   - `SKIP` → The task is marked SKIPPED; downstream tasks with SKIP as their only remaining dep become READY.
+   - `RETRY` → The failed task is reset to READY and re-dispatched (capped at one human-forced retry before re-escalating). For loop steps, this resets the loop to PENDING and re-executes from iteration 1.
+   - `SKIP` → The task is marked SKIPPED; downstream tasks with SKIP as their only remaining dep become READY. For loop steps, the loop is considered completed (as if terminate_on was met).
    - `ABORT` → All pending/ready tasks are CANCELLED; running tasks are killed via Atropos; the workflow is finalized as ABORTED.
    - `RESTART` → The entire workflow is reset; all tasks return to PENDING; execution starts from the beginning.
+   - **`CONTINUE` (v4):** For loop steps only. Accepts the current iteration's output as meeting the `terminate_on` condition. The loop is marked COMPLETED with `loop_status = COMPLETED`. Downstream tasks become READY. The `iteration_log` records this as a human-forced termination. For non-loop tasks, CONTINUE is treated as RETRY (with a logged warning).
 
 ---
 
@@ -1017,7 +1264,7 @@ Lachesis detects hang → Atropos → Kill process group (SIGTERM → SIGKILL) �
 8. Archives captured logs to `{log_dir}/{workflow_id}/{task_id}/{timestamp}/`.
 9. Task is marked `failed` in persistence within an atomic transaction.
 10. Audit entry is created.
-11. **Human intervention** is requested via `HumanNotifier` — the user receives the failure report and logs and must decide how to proceed (RETRY, SKIP, ABORT, or RESTART).
+11. **Human intervention** is requested via `HumanNotifier` — the user receives the failure report and logs and must decide how to proceed (RETRY, SKIP, ABORT, RESTART, or CONTINUE).
 
 ### 11.5 Clotho Timeout
 
@@ -1032,6 +1279,45 @@ Clotho runs → Timeout → Kill Clotho → Capture logs → Notify user → (if
 5. **User notification:**
    - If this was an *initial prompt* or *validation retry*: The flow ends (non-recoverable at this level — user may retry manually).
    - If this was a *mid-flight recovery* (hanging task fix): The system escalates immediately to human intervention, as the workflow now has both a hanging/cleaned-up task AND a dead Clotho. The human must decide (RETRY, SKIP, ABORT, RESTART).
+
+### 11.6 Loop Step Execution Flow
+
+```
+Lachesis delegates to LoopExecutor → Iteration 1 → [inner step 1, inner step 2, ...] → Check terminate_on
+                                                                                                /            \
+                                                                                            Met           Not met
+                                                                                              ↓              ↓
+                                                                                   Loop COMPLETED    current_iteration < max_iterations?
+                                                                                                      /                \
+                                                                                                    Yes                No
+                                                                                                     ↓                  ↓
+                                                                                             Iteration 2          terminate_on empty?
+                                                                                             (context passed                          /        \
+                                                                                              via env vars:          Yes (counter-loop)    No (terminate_on set)
+                                                                                              MOIRAI_LOOP_ITERATION,    ↓                    ↓
+                                                                                              MOIRAI_PREV_OUTPUT,   Loop COMPLETED       Loop EXHAUSTED
+                                                                                              MOIRAI_PREV_OUTPUTS_*)                         ↓
+                                                                                                                                   Human escalation
+                                                                                                                                   or Clotho recovery
+                                                                                                                                   (max_iterations increase allowed)
+```
+
+1. **Lachesis** determines a loop step is READY (all outer dependencies satisfied).
+2. The loop step is dispatched as a single opaque node in the outer DAG (status → RUNNING).
+3. Lachesis delegates to **LoopExecutor** for iteration management.
+4. **Iteration begins:** Inner entry-point steps are initialized as PENDING and dispatched respecting `max_concurrent_inner` concurrency limit (default 1 = sequential).
+5. As each inner step completes, its output is captured in `last_inner_outputs`. The next inner step (based on `deps`) becomes READY.
+6. **When all leaf steps complete:** Their outputs are checked against `terminate_on` using whole-word matching (`\bcondition\b`). If any leaf matches, the condition is met.
+7. **If terminate_on is met:** The loop step completes successfully (COMPLETED). Outer downstream tasks become READY.
+8. **If not met and iterations remain:** The next iteration begins. `LoopExecutor.build_iteration_context()` prepares env vars `MOIRAI_LOOP_ITERATION`, `MOIRAI_PREV_OUTPUT`, and `MOIRAI_PREV_OUTPUTS_*` from `last_inner_outputs`.
+9. **If not met and terminate_on is empty (counter-controlled loop):** After `max_iterations`, loop reports COMPLETED (not EXHAUSTED).
+10. **If not met, terminate_on is set, and max_iterations exhausted:** The loop step is marked FAILED with `failure_reason = LOOP_EXHAUSTED`. Human intervention is requested. Clotho may generate a YAML change that increases `max_iterations` (allowed by Penelope v4).
+11. **Inner step failure:** If any inner step fails (non-zero exit code, crash limit exceeded, or timeout):
+    - All RUNNING inner steps in the same iteration are passed to Atropos for cleanup.
+    - All PENDING inner steps are marked CANCELLED.
+    - The loop step is marked FAILED immediately.
+    - `loop_failed_iterations` is incremented.
+    - This iteration does NOT count toward `max_iterations`.
 
 ---
 
@@ -1054,6 +1340,9 @@ Clotho runs → Timeout → Kill Clotho → Capture logs → Notify user → (if
 | **Lachesis crash** | Lachesis process terminates unexpectedly | On restart: load state, clean up RUNNING tasks via Atropos, resume | Designed crash recovery (see §7.4) |
 | **Human escalation timeout** | No human decision within configured window | System auto-aborts the workflow | Configurable timeout, default 24h |
 | **User-initiated abort** | SIGINT, CLI command, or HumanDecision.ABORT | Lachesis cancels pending tasks, kills running tasks via Atropos, finalizes as ABORTED | Clean shutdown |
+| **Loop step max_iterations exhausted** | Loop has run `max_iterations` times without meeting `terminate_on` | Lachesis marks loop as FAILED with `failure_reason = LOOP_EXHAUSTED` | Human intervention with full iteration history; human may RETRY (reset loop), SKIP (mark completed), ABORT, RESTART, or CONTINUE (accept current output). Clotho may increase `max_iterations` (Penelope v4 allows this) |
+| **Loop inner step crash** | Inner step exits with non-zero code | LoopExecutor marks loop as FAILED, cleans up sibling inner steps via Atropos | Same as task crash — Atropos for cleanup, then human escalation or Clotho recovery |
+| **Loop timeout exceeded** | Loop runs past `loop_timeout` wall-clock limit | LoopExecutor marks loop as FAILED with `failure_reason = TIMEOUT_EXCEEDED` | Human intervention |
 
 ---
 
@@ -1105,6 +1394,10 @@ class MoiraiConfig:
     # Secrets
     secrets_provider: str = "env"              # env, file, vault
     secrets_file: str = ""                     # Path to secrets file (if provider=file)
+    
+    # Loop steps
+    default_loop_max_iterations: int = 5       # Default max_iterations for loop steps
+    default_loop_max_concurrent_inner: int = 1  # (v4) Default max_concurrent_inner for loop steps
 ```
 
 Configuration is loaded from:
@@ -1142,11 +1435,21 @@ All log output is structured JSON to stdout. Log format:
 Log levels: DEBUG, INFO, WARN, ERROR. Each log line includes:
 - `timestamp` (ISO 8601 with milliseconds)
 - `level` (standard log level)
-- `component` (clotho, themis, lachesis, penelope, atropos, scheduler)
+- `component` (clotho, themis, lachesis, loop_executor, penelope, atropos, scheduler)
 - `event` (machine-readable event name)
 - Context fields (workflow_id, task_id, etc.)
 
 Component logs also write to files under `{log_dir}/{component}/{workflow_id}/` for task-level log capture.
+
+**Loop-specific structured log events (v4):**
+| Event | Component | Fields | When |
+|-------|-----------|--------|------|
+| `loop_iteration_started` | loop_executor | workflow_id, loop_id, iteration, max_iterations | When a new iteration begins |
+| `loop_iteration_completed` | loop_executor | workflow_id, loop_id, iteration, terminate_on_met, leaf_outputs | When all inner steps in an iteration complete |
+| `loop_terminate_on_met` | loop_executor | workflow_id, loop_id, iteration, condition, matched_output | When terminate_on condition is satisfied |
+| `loop_terminate_on_not_met` | loop_executor | workflow_id, loop_id, iteration, condition, leaf_outputs | When terminate_on condition is NOT met |
+| `loop_exhausted` | loop_executor | workflow_id, loop_id, max_iterations, last_output, iteration_log | When max_iterations reached without termination |
+| `loop_iteration_context_passed` | loop_executor | workflow_id, loop_id, iteration, context_keys, output_checksum | When context is passed between iterations |
 
 ### 15.2 Internal Metrics
 
@@ -1168,12 +1471,17 @@ class MetricsRegistry:
     llm_call_count: int = 0
     llm_error_count: int = 0
     persistence_errors: int = 0
+    loop_iterations: int = 0                # Total loop iterations executed
+    loop_exhaustions: int = 0               # Loops that hit max_iterations without termination
+    loop_failed_iterations: int = 0         # (v4) Total loop iterations that failed (inner step crash)
     
     # Gauges
     running_tasks: int = 0
     pending_tasks: int = 0
     queue_depth: int = 0
     scheduler_uptime_seconds: float = 0.0
+    active_loop_steps: int = 0              # (v4) Number of loop steps currently in ITERATING state
+    current_loop_iterations: dict[str, int] = field(default_factory=dict)  # (v4) loop_id → current_iteration for all active loops
 ```
 
 Metrics are logged periodically at INFO level (every 60s by default) and can be exposed on a local HTTP endpoint (`http://127.0.0.1:9091/metrics` in Prometheus text format) for production monitoring.
@@ -1196,8 +1504,10 @@ Lachesis exposes a health-check mechanism, either via:
 
 The health response includes:
 ```json
-{"status": "ok", "uptime_seconds": 12345, "workflow_id": "abc-123", "last_task_progress": 1712345678.0, "running_tasks": 2, "queue_depth": 0}
+{"status": "ok", "uptime_seconds": 12345, "workflow_id": "abc-123", "last_task_progress": 1712345678.0, "running_tasks": 2, "queue_depth": 0, "active_loop_steps": 1, "current_loop_iterations": {"feature-work": 3}}
 ```
+
+**v4 additions:** `active_loop_steps` (number of loops currently in ITERATING state), `current_loop_iterations` (map of loop_id → current iteration number for active loops). These enable operators to detect stuck or slowly-progressing loop steps in production.
 
 This enables process supervisors (systemd, Kubernetes) to detect deadlocked or hung scheduler instances.
 
@@ -1241,7 +1551,7 @@ Persistence files are stored at `{persistence_dir}/{workflow_id}/state.json` wit
 
 ```json
 {
-  "schema_version": 2,
+  "schema_version": 4,
   "magic": "MOIRAI_STATE",
   "checksum": "sha256hex...",
   "workflow_id": "abc-123",
@@ -1256,6 +1566,55 @@ Persistence files are stored at `{persistence_dir}/{workflow_id}/state.json` wit
       "exit_code": 0,
       "stdout_path": "/var/log/moirai/wf-abc-123/extract/stdout.log",
       "stderr_path": "/var/log/moirai/wf-abc-123/extract/stderr.log"
+    }
+  },
+  "loop_tasks": {
+    "feature-work": {
+      "task_id": "feature-work",
+      "status": "COMPLETED",
+      "loop_status": "COMPLETED",
+      "current_iteration": 3,
+      "max_iterations": 5,
+      "terminate_on": "APPROVED",
+      "last_inner_outputs": {
+        "implement": "...output of implement step...",
+        "review": "APPROVED - all checks passed"
+      },
+      "last_inner_output": "APPROVED - all checks passed",
+      "loop_failed_iterations": 0,
+      "loop_timeout": null,
+      "loop_started_at": 1712345000.0,
+      "inner_task_states": {
+        "implement": { "task_id": "implement", "status": "COMPLETED", ... },
+        "review": { "task_id": "review", "status": "COMPLETED", ... }
+      },
+      "inner_execution_order": ["implement", "review"],
+      "iteration_log": [
+        {
+          "iteration": 1,
+          "started_at": 1712345000.0,
+          "completed_at": 1712345100.0,
+          "inner_steps": {"implement": {"status": "COMPLETED", "exit_code": 0}, "review": {"status": "COMPLETED", "exit_code": 0}},
+          "terminate_on_met": false,
+          "final_output_truncated": "NEEDS_FIXES - ..."
+        },
+        {
+          "iteration": 2,
+          "started_at": 1712345150.0,
+          "completed_at": 1712345250.0,
+          "inner_steps": {"implement": {"status": "COMPLETED", "exit_code": 0}, "review": {"status": "COMPLETED", "exit_code": 0}},
+          "terminate_on_met": false,
+          "final_output_truncated": "NEEDS_FIXES - ..."
+        },
+        {
+          "iteration": 3,
+          "started_at": 1712345300.0,
+          "completed_at": 1712345400.0,
+          "inner_steps": {"implement": {"status": "COMPLETED", "exit_code": 0}, "review": {"status": "COMPLETED", "exit_code": 0}},
+          "terminate_on_met": true,
+          "final_output_truncated": "APPROVED - all checks passed"
+        }
+      ]
     }
   }
 }
@@ -1292,11 +1651,12 @@ Every component is testable in isolation via its protocol interfaces:
 |-----------|---------------|
 | **Clotho** | Inject `FakeLLMClient` that returns predefined YAML strings; test retry logic with fake validation errors; test investigation with fake `TaskInvestigator` |
 | **Themis** | Inject `FakeLLMClient` that returns predefined validation results; test error shaping |
-| **GraphValidator** | Pure function tests with table-driven graph fixtures (acyclic, cyclic, empty, single-node, diamond, disconnected) |
+| **GraphValidator** | Pure function tests with table-driven graph fixtures (acyclic, cyclic, empty, single-node, diamond, disconnected, loop-with-inner-deps, **loop-opaqueness invariants**: outer cycle through loop detected, inner cycle NOT flagged as outer cycle, cross-boundary dep rejected) |
 | **Lachesis** | Inject `FakePersistenceBackend`, `FakeProcessManager`, `FakeTimeProvider`; test DAG traversal, concurrency limits, hang detection, ready-queue logic |
-| **Penelope** | Pure function tests — table-driven old/new SM + execution state combinations; verify consolidation plan correctness |
+| **LoopExecutor (v4)** | Inject `FakeProcessManager`, `FakeTimeProvider`; test iteration lifecycle (1 run, N runs, max_iterations exhaustion), `terminate_on` matching (whole-word), iteration context passing, inner step failure cleanup, loop timeout, loop opaqueness invariants. Pure function tests for `check_terminate_on()` and `build_iteration_context()`. |
+| **Penelope** | Pure function tests — table-driven old/new SM + execution state combinations; verify consolidation plan correctness. **v4 additions:** EXHAUSTED loop with max_iterations increase; ITERATING loop with terminate_on change. |
 | **Atropos** | Inject `FakeProcessManager` (simulates signal handling), `FakeHumanNotifier`; test cleanup sequence |
-| **HumanIntervention** | Inject fake file-based decision channel; test polling, timeout, fallback |
+| **HumanIntervention** | Inject fake file-based decision channel; test polling, timeout, fallback. Test CONTINUE decision for loop steps. |
 | **Config** | Test validation of every parameter boundary (negative values, missing paths, invalid enums) |
 
 ### 19.2 Integration Testing
@@ -1304,6 +1664,7 @@ Every component is testable in isolation via its protocol interfaces:
 - **Clotho↔Themis↔GraphValidator loop**: Wire components with `FakeLLMClient` that returns controllable error patterns. Test retry exhaustion, backoff behavior, no-op detection.
 - **Lachesis↔Penelope consolidation**: Wire with `FakePersistenceBackend`, test mid-flight change scenarios.
 - **Full pipeline**: End-to-end test with `FakeLLMClient` + `FakeProcessManager` + `MemoryBackend` + `FakeTimeProvider`.
+- **Loop step integration (v4)**: Wire Lachesis with LoopExecutor and loop step definitions; test iteration boundaries (1 run, N runs, max_iterations exhaustion), terminate_on matching (incl. whole-word vs substring), inner step failure propagation, iteration context passing via env vars, loop timeout enforcement, crash recovery with persisted last_inner_outputs.
 
 ### 19.3 Property-Based Testing
 
@@ -1312,6 +1673,9 @@ Key invariants suitable for property-based (Hypothesis-style) testing:
 - "For any two StateMachines and any consistent ExecutionState, Penelope produces a ConsolidationPlan that is either valid or identifies specific blocking errors."
 - "For any valid DAG, GraphValidator's topological sort produces an order where every task appears after all its dependencies."
 - "Consolidation is idempotent: applying the same plan twice to the same state produces the same result."
+- "For any loop step with a valid inner DAG, the number of iterations never exceeds max_iterations."
+- "A loop step is opaque to the outer DAG — the outer graph's acyclicity is preserved regardless of inner step topology."
+- "For any loop step, check_terminate_on(output, condition) returns True iff the condition appears as a whole word (\\bcondition\\b) in the output."
 
 ### 19.4 Test Infrastructure
 
@@ -1321,6 +1685,7 @@ Key invariants suitable for property-based (Hypothesis-style) testing:
 - `FakeTimeProvider` with manual time advancement
 - `FakeHumanNotifier` with programmable decision injection
 - `MoiraiTestHarness` for wiring components with test doubles
+- `FakeLoopExecutor` (v4) — implements `LoopExecutor` protocol (§4.7). Configurable behavior: returns predefined `LoopIterationResult` for test control. Used for testing Lachesis's loop step delegation in isolation.
 
 ---
 
@@ -1342,7 +1707,7 @@ The following assumptions are made about the system's environment and design. Th
 
 7. **Human intervention channel**: The system notifies humans via `HumanNotifier` (file signal, stdout, or UI callback). Humans respond by writing a decision file. If no response within `human_response_timeout`, the system auto-aborts.
 
-8. **No cyclic dependencies**: GraphValidator guarantees that the state machine is a DAG via deterministic cycle detection. Lachesis does not handle or detect cycles.
+8. **No cyclic dependencies in outer DAG**: GraphValidator guarantees that the outer state machine is a DAG via deterministic cycle detection. Loop steps are opaque — their inner sub-graph can contain cycles (e.g., implement→review→implement→review) that are invisible to the outer DAG.
 
 9. **Homogeneous agent interface**: All agents expose a consistent interface: child process with exit code reporting. The exact command and environment are defined per-agent in the agent registry (see §8).
 
@@ -1351,6 +1716,14 @@ The following assumptions are made about the system's environment and design. Th
 11. **Themis renaming**: The existing Hermes profile named `themis` will need to be renamed before this component is implemented, to avoid a naming conflict.
 
 12. **POSIX platform**: Moirai targets POSIX-compatible systems (Linux, macOS). Windows is not supported in v1. Process signaling, process groups, and `setrlimit` are POSIX-specific.
+
+13. **Loop steps are bounded**: Every loop step must have a finite `max_iterations` setting. Infinite loops are not supported. The `terminate_on` condition provides early exit but `max_iterations` is the hard upper bound.
+
+14. **Loop step outputs are text**: The `terminate_on` check uses **whole-word matching** (`\bcondition\b`) on the leaf step(s) stdout. Structured output checking (e.g., JSON field matching) is a future enhancement. Whole-word matching prevents false positives (e.g., "APPROVED" does not match "UNAPPROVED").
+
+15. **Inner step dispatch is parallelizable**: Inner steps within a loop iteration can execute in parallel if their `deps` graph permits and `max_concurrent_inner > 1`. The outer DAG's `max_concurrent_tasks` limit does not affect inner step concurrency.
+
+16. **Counter-controlled loops**: A loop step with an empty `terminate_on` runs exactly `max_iterations` iterations and reports as COMPLETED (not EXHAUSTED). This enables fixed-iteration batch processing.
 
 ---
 
@@ -1388,6 +1761,10 @@ The following questions are not yet resolved and require design decisions:
 
 15. **Is there a web UI?** Out of scope for v1/v2. Future consideration.
 
+16. ~~**How does context pass between loop iterations?**~~ **RESOLVED (v4)** — LoopExecutor sets environment variables `MOIRAI_LOOP_ITERATION=N`, `MOIRAI_PREV_OUTPUT=<output>`, and per-step `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>` for each inner step. See §7.4 (item 6) and §4.7 (`LoopExecutor.build_iteration_context()`).
+
+17. **Can loop steps be nested?** v3 does not support nested loops (a loop step's inner steps cannot themselves be loop steps). This is a future enhancement.
+
 ---
 
 ## 22. Glossary
@@ -1401,6 +1778,7 @@ The following questions are not yet resolved and require design decisions:
 | **Lachesis** | Measurer — deterministic scheduler that executes the state machine |
 | **Penelope** | Weaver — deterministic consolidation component that diffs old and new state machines |
 | **Atropos** | Cutter — cleanup component that terminates hanging tasks and captures logs |
+| **LoopExecutor** | (v4) Standalone component managing loop iteration lifecycle, extracted from Lachesis for testability |
 | **State Machine** | Formal representation of the workflow as a directed acyclic graph (DAG) of tasks |
 | **YAML Artifact** | The workflow definition file generated by Clotho and consumed by Themis |
 | **Task** | A single unit of work in the workflow, with properties, agent assignment, and dependencies |
@@ -1413,6 +1791,13 @@ The following questions are not yet resolved and require design decisions:
 | **LLMClient** | Protocol abstracting LLM API calls for testability |
 | **TaskInvestigator** | Bounded context for Clotho to investigate hanging tasks |
 | **HumanNotifier** | Interface for requesting and polling human decisions |
+| **Loop Step** | A task node in the outer DAG that internally executes a sub-graph of steps in a bounded iteration loop with a termination condition |
+| **Loop Iteration** | One complete execution of all inner steps within a loop step |
+| **terminate_on** | A whole-word matched condition checked against leaf inner step(s) output; when matched, the loop step completes early. Empty string = counter-controlled loop (runs exactly max_iterations) |
+| **max_iterations** | The hard upper bound on the number of iterations a loop step may execute |
+| **LOOP_EXHAUSTED** | A failure reason indicating a loop step reached max_iterations without meeting its terminate_on condition |
+| **Counter-controlled loop** | (v4) A loop step with empty `terminate_on` that runs exactly `max_iterations` iterations and reports COMPLETED |
+| **Whole-word matching** | (v4) `terminate_on` check uses `\bcondition\b` regex boundary to prevent false positives from substring matches |
 
 ---
 
@@ -1420,5 +1805,7 @@ The following questions are not yet resolved and require design decisions:
 
 | Version | Date | Author | Changes |
 |---------|------|--------|---------|
+| 4 | 2026-07-08 | Daedalus (architect) | **v4 — Applied all v3 review comments:** Extracted `LoopExecutor` protocol (§4.7) + component; extracted `check_terminate_on()` as pure function with whole-word (`\b\b`) matching; resolved Open Question #16 (iteration context passing via env vars `MOIRAI_LOOP_ITERATION`, `MOIRAI_PREV_OUTPUT`, `MOIRAI_PREV_OUTPUTS_*`); added `HumanDecision.CONTINUE` (§3, §10); changed `LoopTaskState.last_inner_output` to `last_inner_outputs: dict[str, str]` (§3); added `loop_failed_iterations`, `iteration_log`, `loop_timeout`, `loop_started_at` to `LoopTaskState` (§3); added `loop_timeout`, `max_concurrent_inner` to `LoopDef` (§3); unified inner step field name from `depends_on` to `deps` with backward-compat alias (§5); allowed empty `terminate_on` for counter-controlled loops (§6, §7.4); resolved §7.4/§7.5 contradiction — EXHAUSTED loops now allow `max_iterations` increase via Penelope (§7.5); clarified multi-leaf inner DAG termination check (all leaf outputs checked, any match wins) (§7.4); defined inner step failure cleanup (sibling steps cancelled via Atropos) (§7.4); added per-iteration log paths (`iter_{N}/`) (§9); added loop-specific structured log events (§15.1); added `active_loop_steps`, `current_loop_iterations` to health endpoint and metrics (§15.2, §15.4); added loop opaqueness test fixtures (§6, §19.1); defined `inner_execution_order` as cached topological sort from Lachesis (§7.4); documented crash recovery dependency on persisted `last_inner_outputs` (§7.4); added inner step agent validation to GraphValidator (§6); bumped persistence schema_version to 4 with `iteration_log`, `last_inner_outputs`, `loop_failed_iterations` (§18). |
+| 3 | 2026-07-08 | Daedalus (architect) | **Added loop step support:** Added `LoopStatus` enum, `LoopTaskState` dataclass, `LoopDef` dataclass (in §3). Added `LOOP_EXHAUSTED` to `FailureReason`. Updated `StateMachine` with `loop_tasks` field. Updated `ExecutionState` with `loop_tasks` tracking. Added loop step YAML schema example and rules table (in §5). Updated GraphValidator (§6) to treat loop steps as opaque nodes in the outer DAG — inner cycle detection bypassed for acyclicity check, cross-boundary dependency validation added. Updated Lachesis (§7.4) with loop step execution lifecycle — iteration management, terminate_on checking, iteration context passing, exhaustion escalation, and inner step hang detection. Updated Penelope (§7.5) with loop step consolidation rules. Updated human intervention protocol (§10) for loop exhausted scenarios. Added loop step execution flow diagram (new §11.6). Added loop exhaustion and inner step crash entries to error handling table (§12). Added `default_loop_max_iterations` to config (§13). Added `loop_iterations` and `loop_exhaustions` counters to metrics (§15.2). Updated persistence file format with `loop_tasks` section (§18). Added loop-related test fixtures to testing strategy (§19). Updated assumptions (§20) for loop step opacity and bounded iteration. Added loop step, loop iteration, terminate_on, max_iterations, LOOP_EXHAUSTED to glossary (§22). Added open questions for inter-iteration context passing and nested loops (§21). Bumped persistence schema_version to 3. |
 | 2 | 2026-07-08 | Daedalus (architect) | **Major update addressing all 4 agent reviews:** Added core data structures (§3), protocol interfaces (§4), YAML workflow schema (§5), GraphValidator component (§6), agent registry (§8), task dispatch/process model (§9), human intervention protocol (§10), secrets management (§14), observability (§15), resource management (§16), workflow cancellation (§17), persistence format & versioning (§18), testing strategy (§19), crash recovery (in §7.4), consolidation atomicity (in §7.5), retry backoff (in §7.1, §7.2), Clotho timeout recovery path (in §11.5), process-group cleanup (in §7.6), structured logging (in §15.1), metrics (in §15.2), audit trail (in §15.3), health checks (in §15.4), configuration validation (in §13), secrets management (§14), config validation (§13), no-op retry detection (in §7.1), modified-task compatibility matrix (in §7.5), concurrency config (in §7.4), graceful shutdown (in §7.4), persistence versioning (in §18), platform assumptions (in §20.12). Resolved 9 open questions. |
 | 1 | 2026-07-08 | Hermes Agent | Initial specification from architecture thoughts wiki note |

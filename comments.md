@@ -516,6 +516,366 @@ As a developer sitting down to write `moirai/__init__.py` and the first componen
 | **Atropos** | C | B+ | Process group management, retry loop, log path convention, ProcessManager protocol — step-by-step procedure clear |
 | **Integration / Wiring** | D | C+ | Pipeline composition documented, mid-flight recovery protocol defined, test harness specified — still requires careful orchestration |
 
-**Bottom line:** The spec has moved from architecture-concept level to implementation-ready. All 5 foundational gaps are resolved. A competent Python developer can now implement all components with confidence.
+|**Bottom line:** The spec has moved from architecture-concept level to implementation-ready. All 5 foundational gaps are resolved. A competent Python developer can now implement all components with confidence.
 
   > @atlas (v2): Looks good, closing.
+
+---
+
+# Argus Panoptes — Testability Review (v3: Loop Steps)
+
+> Review date: 2026-07-08
+> Focus: Testability of loop steps — inner steps, iteration logic, terminate_on matching
+
+---
+
+## Loop Step Execution Logic (§7.4)
+
+- [x] @argus (v3): **Loop iteration logic is embedded inside Lachesis, not extracted into a testable unit.** The full iteration lifecycle (§7.4 items 1-9) is described as procedural steps within Lachesis's scheduler loop. This means testing iteration boundaries (1 run, N runs, max_iterations exhaustion), terminate_on matching, iteration context passing, and inner step dispatch all require wiring up a full Lachesis with fakes. The logic should be extracted into a standalone `LoopExecutor` with a defined interface (`execute_iteration(loop_state, state_machine) -> LoopStatus` or similar) that can be unit-tested in isolation without the scheduler loop. The `FakeLoopExecutor` named in §19.4 hints at this but provides no interface or behaviour — it's a placeholder, not a spec.
+  > @daedalus: Addressed in v4. Added §4.7 LoopExecutor Protocol with `execute_iteration()`, `check_terminate_on()`, and `build_iteration_context()` methods. Added `LoopIterationResult` dataclass. Added `loop_executor.py` to module structure (§2). Updated §7.4 to delegate loop iteration to LoopExecutor. `FakeLoopExecutor` now has a defined contract (§19.4).
+
+- [x] @argus (v3): **`terminate_on` substring matching is not extracted into a pure, independently testable function.** The spec says "Check if the output contains the `terminate_on` substring" (§7.4 item 4), which is trivially testable as a pure function (`matches_termination_condition(output: str, condition: str) -> bool`). But it's described as inline logic within Lachesis's loop management, not isolated into its own function or strategy object. Without extraction, a change to the matching strategy (e.g., regex, JSON field matching, structured output) would require modifying Lachesis itself rather than swapping a strategy implementation.
+  > @daedalus: Addressed in v4. `LoopExecutor.check_terminate_on()` defined as a pure function on the protocol (§4.7). Uses whole-word matching (`\bcondition\b`). Upgraded from bare substring to word-boundary regex to address the false-positive issue raised by Themis. Testable independently in `tests/loop_executor_test.py`.
+
+- [x] @argus (v3): **Context passing between iterations is undefined (Open Question #16).** The spec says "The previous iteration's outputs are available as context for the next iteration (passed via `inputs` or environment)" but the mechanism is deliberately left as an open question. This blocks testing of the iteration handoff — you cannot write a test that verifies iteration N receives iteration N-1's final output until the passing mechanism is formalised. Recommend specifying at minimum a `context: dict[str, str]` parameter that flows between iterations, so tests can assert on its contents.
+  > @daedalus: Addressed in v4. Open Question #16 resolved. Mechanism: `LoopExecutor.build_iteration_context()` sets env vars `MOIRAI_LOOP_ITERATION=N`, `MOIRAI_PREV_OUTPUT=<leaf_output>`, and `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>` per step. `LoopTaskState.last_inner_outputs: dict[str, str]` is the authoritative persisted source. See §7.4 item 6 and §4.7.
+
+- [x] @argus (v3): **Inner step execution shares the same concurrency pool as outer tasks with no isolation.** Inner steps within a loop are dispatched "following the same process model as outer tasks" (§7.4 item 3) and use the same `ProcessManager` and `max_concurrent_tasks` limit. An active loop with multiple parallel inner steps can starve outer tasks (or other loops) of concurrency slots. For testing, there's no boundary to verify that loop-internal scheduling doesn't interfere with outer-DAG scheduling. Recommend loop steps get their own `max_concurrent_inner` config (defaulting to sequential execution = 1) to keep inner dispatch independently testable.
+  > @daedalus: Addressed in v4. Added `LoopDef.max_concurrent_inner: int = 1` (§3) and `default_loop_max_concurrent_inner: int = 1` to config (§13). LoopExecutor uses its own concurrency limit, independent of the outer scheduler's `max_concurrent_tasks`. Inner steps do not consume outer scheduler concurrency slots.
+
+- [x] @argus (v3): **Inner step hang detection may double-handle with outer hang detection.** §7.4 says "Hang detection applies equally to inner steps within a loop — if an inner step hangs, it is cleaned up by Atropos and the loop step is marked FAILED." But Lachesis's main polling loop iterates over "each running task" globally. If both the inner step (as a subprocess) and the loop step (as an opaque outer node) appear in the same polling pass, there's potential for double-handling — Atropos could be called on the inner step, then on the loop step itself. The spec should clarify whether inner steps are polled through the same scheduler path or abstracted behind the loop step's own execution manager.
+  > @daedalus: Addressed in v4. Inner steps are polled through LoopExecutor, NOT through Lachesis's main polling loop. §7.4 item 4 documents this explicitly: "Inner steps are polled through LoopExecutor... This avoids double-handling with outer hang detection." Atropos receives the inner step's scoped task_id (`{loop_id}.{inner_step_id}`) for cleanup.
+
+## Loop Step Crash Recovery (§7.4)
+
+- [x] @argus (v3): **Crash recovery for loops discards inner state and re-enters from the start of the current iteration.** §7.4 crash recovery says loop tasks in `ITERATING` state are "reset to their last completed iteration boundary (inner task state is discarded, loop re-enters the iteration from the start of the current iteration)." This means inner steps that had already completed in the current iteration will be re-executed — which is safe but requires testing. However, this is only testable via an integration test that simulates Lachesis crash + restart with a persisted loop mid-iteration. There is no unit-level test path for this scenario. Consider adding a `LoopTaskState.recover()` method that can be unit-tested.
+  > @daedalus: Addressed in v4. Crash recovery clause in §7.4 now explicitly states: "current_iteration counter is preserved (not decremented), so iteration N is re-attempted from scratch. LoopTaskState.last_inner_outputs (persisted) provides context for the re-started iteration." The dependency on persisted `last_inner_outputs` is documented. Unit-testable via `LoopExecutor.execute_iteration()` with a state loaded from a crashed checkpoint.
+
+## Loop Step Opaqueness Invariant (§6, §20 Assumption #8)
+
+- [x] @argus (v3): **No isolated test fixture for the "loop step is opaque to the outer DAG" invariant.** Assumption #8 and §6 both state loop steps are treated as single opaque nodes for outer acyclicity. The testing strategy (§19.3) lists a property-based invariant but no concrete unit-test fixtures for GraphValidator that verify: (a) an outer cycle *through* a loop step is detected, (b) an inner cycle does NOT cause an outer acyclicity failure, (c) cross-boundary dependency references are caught (inner step depending on outer task, outer task depending on inner step). These should be added as explicit table-driven test cases.
+  > @daedalus: Addressed in v4. Added explicit loop-opaqueness invariants with test fixture descriptions in §6 (after item 9). §19.1 now lists "loop-opaqueness invariants: outer cycle through loop detected, inner cycle NOT flagged as outer cycle, cross-boundary dep rejected" as GraphValidator test fixtures.
+
+## Penelope Loop Consolidation (§7.5)
+
+- [x] @argus (v3): **Loop step consolidation rules are testable but have a gap in the compatibility matrix.** The rules for PENDING → reset, ITERATING → reset, COMPLETED/EXHAUSTED → fail, and type conversion → removed+new are all pure-function testable — good. **However**, there's a missing rule: what happens when a loop step's `terminate_on` string changes mid-flight while the loop is ITERATING? Is the new condition picked up on the next iteration (compatible), or does the loop need to reset to PENDING (incompatible)? The consolidation matrix doesn't address this case, leaving it ambiguous for tests.
+  > @daedalus: Addressed in v4. Added explicit rule: "Loop step changed — terminate_on modified: If PENDING or ITERATING: compatible (condition changes take effect next iteration). Loop is NOT reset to PENDING — the current iteration continues with the new condition. If COMPLETED or EXHAUSTED: fail (unless EXHAUSTED with only max_iterations increase, see below)." See §7.5 consolidation rules table.
+
+## GraphValidator Loop Validation (§6)
+
+- [x] @argus (v3): **GraphValidator loop validation is well-specified and testable.** §6 items 8-9 define clear deterministic checks: inner dependency scoping, connected sub-graph within the loop, non-empty steps, positive max_iterations, non-empty terminate_on, no cross-boundary references. These are pure-function tests with table-driven graph fixtures — the gold standard of testability. No issues found.
+
+## Test Infrastructure (§19.4)
+
+- [x] @argus (v3): **`FakeLoopExecutor` in test infrastructure (§19.4) is undefined.** It's listed as a test fake alongside `FakeLLMClient`, `FakeProcessManager`, `MemoryBackend`, etc., but has no specification — no interface it implements, no methods, no behaviour contract. Every other fake in the list has a corresponding protocol defined in §4 (LLMClient, ProcessManager, PersistenceBackend, TimeProvider, HumanNotifier). No corresponding `LoopExecutor` or `LoopRunner` protocol exists anywhere in the spec. A protocol needs to be defined first before the fake has a contract to implement.
+  > @daedalus: Addressed in v4. Added §4.7 LoopExecutor Protocol with defined methods. `FakeLoopExecutor` is now specified in §19.4 as implementing `LoopExecutor` protocol with configurable behavior (returns predefined `LoopIterationResult`).
+
+## Property-Based Testing (§19.3)
+
+- [x] @argus (v3): **Two loop-related invariants are listed for property-based testing.** §19.3 includes: "For any loop step with a valid inner DAG, the number of iterations never exceeds max_iterations" and "A loop step is opaque to the outer DAG — the outer graph's acyclicity is preserved regardless of inner step topology." These are good invariants. No issues found with the properties themselves, though they depend on the `LoopExecutor` abstraction being extracted (see above) to be practically testable.
+
+---
+
+## Summary
+
+| Area | Status | Key Gaps |
+|------|--------|----------|
+| **Iteration logic isolation** | ❌ Not extracted | Embedded in Lachesis — should be `LoopExecutor` |
+| **terminate_on matching** | ❌ Not extracted | Inline in Lachesis — should be pure function/strategy |
+| **Context passing** | ❌ Open Question #16 | Mechanism undefined — can't test |
+| **Inner concurrency isolation** | ❌ Undefined | Shares outer pool — testability unclear |
+| **Inner hang detection** | ⚠️ Ambiguous | Double-handling risk with outer polling |
+| **Crash recovery for loops** | ⚠️ Integration-only | No unit-level test path |
+| **Loop opaqueness invariant** | ⚠️ Property-only | No concrete table-driven GraphValidator fixtures |
+| **Penelope loop rules** | ⚠️ Gap in matrix | Missing rule for terminate_on change mid-iteration |
+| **GraphValidator loop validation** | ✅ Good | Pure function, table-driven |
+| **Property-based invariants** | ✅ Good | Two listed, well-formed |
+| **FakeLoopExecutor** | ❌ No contract | No protocol defined — can't implement |
+
+**Biggest structural recommendations for loop testability (priority order):**
+
+1. Extract loop iteration logic into a standalone `LoopExecutor` protocol + implementation, testable via `FakeProcessManager`.
+2. Extract `terminate_on` matching into a pure function/strategy with a defined interface.
+3. Resolve Open Question #16 (context passing between iterations) to unblock iteration handoff tests.
+4. Add concrete table-driven GraphValidator test cases for loop opaqueness invariants.
+5. Define the `LoopExecutor` protocol so `FakeLoopExecutor` has a contract.
+
+---
+
+# Hephaestus — Implementability Review (v3)
+
+> Review date: 2026-07-08
+> Focus: Loop step additions — implementability, well-defined iteration logic, missing details
+> Role: Master builder / developer — can I implement the loop iteration logic from this spec?
+
+---
+
+## Loop Step Data Structures (§3)
+
+- [x] @hephaestus (v3): **Inner step type mismatch — `TaskDef.deps` vs. inner step `depends_on`.** The YAML schema (§5) uses `depends_on` for inner steps, but `LoopDef.inner_steps` is typed as `list[TaskDef]`, and `TaskDef` has a field named `deps`, not `depends_on`. A developer needs to know: is there a separate `InnerTaskDef` type? Does the YAML parser map `depends_on → deps` on load? Or is there a field alias? Without this decision, the inner step objects that Lachesis receives will have empty `deps` lists because the YAML used the wrong key name. This is a concrete implementation blocker.
+  > @daedalus: Addressed in v4. Unified field naming: both outer tasks and inner steps now use `deps` in the YAML schema (§5). The YAML parser accepts both `deps` and `depends_on` for backward compatibility with v3 workflows, mapping both to `TaskDef.deps`. Inner steps are `TaskDef` objects (no separate type needed).
+
+- [x] @hephaestus (v3): **`LoopTaskState.inner_execution_order` source is undefined.** The field exists in the dataclass with `field(default_factory=list)`, but the spec never says who populates it or when. Is it computed by GraphValidator during inner validation? By Lachesis at iteration start via a topological sort of inner steps? The spec mentions "final step in the inner execution order" but doesn't define how that order is determined. A developer needs a clear statement: "Lachesis computes a topological sort of inner_steps at first dispatch and stores it in `inner_execution_order`."
+  > @daedalus: Addressed in v4. `LoopTaskState.inner_execution_order` is now documented as the cached topological order computed by Lachesis (LoopExecutor) at first dispatch (§3 docstring on field, §7.4 item 1). It's a pre-computed deterministic order used as a tiebreaker for leaf-step ordering.
+
+- [x] @hephaestus (v3): **`LoopDef.terminate_on` default empty string vs. YAML "required" vs. GraphValidator non-empty check.** Minor inconsistency: the dataclass defaults `terminate_on` to `""`, the YAML schema says it's required, and GraphValidator rejects empty strings. This means you can create a `LoopDef("my-loop")` in Python code that passes runtime type checks but fails GraphValidator validation. A `None` default with a `@dataclass` validator or a clear comment would eliminate ambiguity. Recommend: make `terminate_on: str` (no default) in the dataclass, since it's required semantically.
+  > @daedalus: Addressed in v4. `terminate_on` is now allowed to be empty (""), designating a counter-controlled loop. §6 GraphValidator no longer rejects empty `terminate_on`. §5 schema marks it as no longer "required" — default is empty string. Empty terminate_on means the loop runs exactly `max_iterations` iterations and reports COMPLETED. See §3 docstring on `LoopDef.terminate_on` and §7.4 item 5 (counter-controlled loop path).
+
+## YAML Schema (§5)
+
+- [x] @hephaestus (v3): **Inner steps use `depends_on` while outer tasks use `deps` — inconsistent naming.** The YAML schema table shows inner steps use `depends_on` (line 604) but outer tasks use `deps` (line 588). This inconsistency means Clotho's prompt template must know to emit different key names for inner vs. outer steps, and the YAML parser must handle both. If the intent is to avoid confusion with outer `deps`, then either rename outer `deps` to `depends_on` for consistency, or use a unified field name everywhere. Different names for the same concept (dependency list) increases implementation surface area for no clear benefit.
+  > @daedalus: Addressed in v4. Unified to `deps` throughout. Both outer tasks and inner steps now use `deps`. The YAML parser accepts both `deps` and `depends_on` for backward compatibility with v3 workflows, with a deprecation warning for `depends_on`. See §5 table note.
+
+- [x] @hephaestus (v3): **`terminate_on` is marked as "required" but has a default value (5).** The schema table says terminate_on is "yes" required. This is correct architecturally — every loop needs a termination condition. But the default value column shows 5 (which is max_iterations' default), and terminate_on has no default shown. The table formatting is slightly confused here. Not a blocker, but the table should show `terminate_on` has no default (it's required).
+  > @daedalus: Addressed in v4. `terminate_on` is now optional (default: `""`) in the schema table. Empty string designates a counter-controlled loop. The table now correctly shows no default for required fields and `""` default for terminate_on. The formatting issue with "5" in the wrong column is fixed.
+
+## GraphValidator (§6)
+
+- [x] @hephaestus (v3): No issues. Opaque-node treatment for loop steps in outer DAG acyclicity is correct and implementable. Cross-boundary dependency validation (no outer → inner, no inner → outer) is clearly specified. Inner DAG connectivity check is well-scoped. All constraints (non-empty steps, positive max_iterations, non-empty terminate_on) are explicitly checkable.
+
+## Lachesis — Loop Step Execution (§7.4)
+
+- [x] @hephaestus (v3): **Ambiguous "final inner step" — undefined when inner DAG has multiple terminal nodes.** The spec checks `terminate_on` against "the output of the final inner step (by convention the last step in the inner execution order)." But if the inner DAG has parallel branches (e.g., A→B and C→D as independent chains), there are two terminal nodes with no topological ordering between them. Which output is "final"? The spec needs to define a rule: (a) there must be exactly one inner terminal node, or (b) all terminal outputs are checked, or (c) the `terminate_on` match is checked against a specific named step designated in the loop definition. Without this, the implementation is ambiguous for any non-linear inner DAG.
+  > @daedalus: Addressed in v4. The rule is now: all leaf step outputs are collected. If `terminate_on` is non-empty, it's checked against ALL leaf step outputs using whole-word matching. If ANY leaf matches, the condition is met. This provides clear, deterministic semantics for parallel inner DAGs. See §7.4 item 5.
+
+- [x] @hephaestus (v3): **Iteration context passing (Open Question #16) is a hard implementation blocker.** The spec says "The previous iteration's outputs are available as context for the next iteration (passed via `inputs` or environment)" — but this is aspirational, not actionable. Open Question #16 explicitly says "the mechanism needs precise specification." This means a developer cannot implement iteration context passing. Specific unknowns: (a) Are ALL inner step outputs from the previous iteration made available, or only the final step's output? (b) If via `inputs`, does Lachesis mutate the `LoopDef`'s step definitions to inject previous outputs as input parameters? (c) If via env vars, what naming convention is used? (d) Does context accumulate across iterations (iteration 3 sees outputs from iter 1 and 2) or is it only the immediately preceding iteration? This needs resolution before the loop implementation is complete.
+  > @daedalus: Addressed in v4. Open Question #16 resolved. All answers: (a) ALL inner step outputs from the previous iteration are made available via `last_inner_outputs: dict[str, str]`; (b) Context is passed via environment variables, not by mutating step definitions; (c) Env var naming: `MOIRAI_LOOP_ITERATION=N`, `MOIRAI_PREV_OUTPUT=<leaf_output>`, `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>`; (d) Only the immediately preceding iteration's outputs are available (not accumulated history — iteration history is kept in `iteration_log`). See §7.4 item 6 and §4.7 `build_iteration_context()`.
+
+- [x] @hephaestus (v3): **Inner step failure leaves sibling steps orphaned.** The spec says "If any inner step fails... the loop step is marked FAILED immediately." But it doesn't specify what happens to other inner steps that are still RUNNING or PENDING in the same iteration. Should they be cancelled via Atropos? Left running as orphans? The current design would leak subprocesses. A developer needs: "On inner step failure, all RUNNING inner steps are passed to Atropos for cleanup, and all PENDING inner steps are marked CANCELLED."
+  > @daedalus: Addressed in v4. §7.4 item 11 now explicitly states: "All RUNNING inner steps in the same iteration are passed to Atropos for cleanup. All PENDING inner steps are marked CANCELLED." Also documented in §11.6 item 11 and §12 error table entry for loop inner step crash.
+
+- [x] @hephaestus (v3): **Inner step hang detection applies Atropos at the inner step level, but the loop step's outer status is unclear.** The spec says "if an inner step hangs, it is cleaned up by Atropos and the loop step is marked FAILED." But Atropos operates on the outer task_id (the loop step's ID), while the hanging entity is an inner step. How does Atropos know which process to kill — the inner step's subprocess or the loop step's (non-existent) process? Since loop steps don't have their own process (inner steps are the subprocesses), Atropos needs the inner step's ProcessInfo. But Atropos's interface takes a `task_id: str` and `task_process_info: ProcessInfo`. The developer needs to know whether Atropos receives the inner step's task_id or the loop step's task_id for inner step failures.
+  > @daedalus: Addressed in v4. Atropos receives the inner step's scoped task_id (`{loop_id}.{inner_step_id}`) and the inner step's ProcessInfo for inner step hangs/cleanup. §7.6 input description updated to clarify: "for inner step hangs, this is the scoped ID `{loop_id}.{inner_step_id}`". §7.4 item 4 documents this explicitly.
+
+- [x] @hephaestus (v3): **Crash recovery of ITERATING loops is loosely defined.** "Loop tasks in ITERATING state are reset to their last completed iteration boundary (inner task state is discarded, loop re-enters the iteration from the start of the current iteration)." This is ambiguous: does "the current iteration" mean the iteration that was in progress at crash time (which may have partially-completed inner steps), or does it mean the iteration before the one in progress? If an inner step completed in iteration 2 but Lachesis crashed before iteration 2 finished, is that inner step's work discarded? A clearer rule: "On crash recovery, ITERATING loops are reset to the start of the iteration indicated by `current_iteration`. All inner task state is discarded. The loop's `current_iteration` counter is preserved (not decremented), so that iteration N is re-attempted from scratch."
+  > @daedalus: Addressed in v4. Crash recovery clause in §7.4 now reads: "Loop tasks in ITERATING state are reset to the start of the iteration indicated by `current_iteration`. All inner task state is discarded. The `current_iteration` counter is preserved (not decremented), so iteration N is re-attempted from scratch. `LoopTaskState.last_inner_outputs` (persisted) provides context for the re-started iteration."
+
+## Penelope — Loop Step Consolidation (§7.5)
+
+- [x] @hephaestus (v3): **Contradiction between exhaustion escalation and consolidation rules.** The escalation path in §7.4 says "Clotho may be invoked to generate a new YAML that modifies the loop step (e.g., increasing max_iterations, changing terminate_on)." But the Penelope consolidation rules say: "If [loop step is] COMPLETED or EXHAUSTED: fail — cannot change a loop whose execution has finished." This is a direct contradiction — the escalation path explicitly suggests modifying an EXHAUSTED loop (increasing max_iterations), but Penelope will reject that exact change. A developer implementing this will hit this contradiction immediately. Recommendation: resolve by either (a) allowing max_iterations increase for EXHAUSTED loops as a special case, or (b) removing the "increase max_iterations" suggestion from the escalation path and requiring a different recovery approach (e.g., replacing the loop step with alternative tasks).
+  > @daedalus: Addressed in v4. Chose option (a): Penelope now allows `max_iterations` increase for EXHAUSTED loops as a special exception. See §7.5 consolidation rules table — "Loop step changed — max_iterations increased only: If EXHAUSTED: Allowed. The loop is reset to ITERATING with current_iteration preserved. Termination condition and inner step definitions must be identical."
+
+- [x] @hephaestus (v3): **"Loop step changed — inner steps modified" rule for ITERATING doesn't specify cleanup.** The rule says: "If the loop step is PENDING or ITERATING: reset to PENDING and re-validate inner steps via GraphValidator." If the loop is ITERATING, there may be running inner step subprocesses. "Reset to PENDING" doesn't imply cleanup of those processes. A developer needs: "If ITERATING, first cancel all running inner steps via Atropos, then reset to PENDING."
+  > @daedalus: Addressed in v4. The rule now reads: "If PENDING or ITERATING: cancel all running inner steps via Atropos, reset to PENDING, re-validate inner steps via GraphValidator." See §7.5.
+
+## Human Intervention (§10) — Loop-Specific
+
+- [x] @hephaestus (v3): No issues. RETRY and SKIP behaviors for loop steps are well-defined: RETRY resets the loop to PENDING and re-executes from iteration 1; SKIP marks the loop as completed as if terminate_on was met. These are implementable.
+
+## Error Handling (§12)
+
+- [x] @hephaestus (v3): No issues. The loop exhaustion and inner step crash error entries are consistent with the rest of the error table and clearly specify trigger, response, and recovery.
+
+## Metrics (§15.2)
+
+- [x] @hephaestus (v3): No issues. `loop_iterations` and `loop_exhaustions` counters are well-chosen and implementable.
+
+## Persistence (§18)
+
+- [x] @hephaestus (v3): No issues. The `loop_tasks` section in the persistence format example is clear and shows all relevant fields (status, loop_status, current_iteration, max_iterations, terminate_on, last_inner_output, inner_task_states). A developer can serialize/deserialize this confidently.
+
+## Testing Strategy (§19)
+
+- [x] @hephaestus (v3): No issues. Loop step integration test scenarios are mentioned (§19.2). Property-based invariant "number of iterations never exceeds max_iterations" is well-chosen (§19.3). `FakeLoopExecutor` in test infrastructure (§19.4) enables isolated testing. GraphValidator test fixtures include "loop-with-inner-deps" (§19.1). These are sufficient for a developer to write tests.
+
+## Assumptions (§20)
+
+- [x] @hephaestus (v3): No issues. Assumption #13 (bounded iteration) and #14 (text output for terminate_on) are clearly stated and inform implementable constraints.
+
+## Open Questions (§21)
+
+- [x] @hephaestus (v3): **Open Question #16 (iteration context passing) blocks complete implementation.** As noted above, the mechanism for passing outputs between loop iterations is underspecified. This needs resolution before the loop feature can be considered implementable. Recommended approaches (for resolution): (a) Lachesis sets environment variables `MOIRAI_LOOP_ITERATION=N` and `MOIRAI_PREV_OUTPUT=<last_inner_step_stdout>` for each inner step in subsequent iterations, or (b) Lachesis writes previous outputs to a well-known file path `{workspace}/{loop_id}/iteration_{N-1}/` and passes the path via an input parameter `previous_iteration_dir`. Either approach would be implementable.
+  > @daedalus: Addressed in v4. Open Question #16 marked RESOLVED. Chose option (a) — environment variables. See §21.16 and §7.4 item 6 for full specification. `LoopExecutor.build_iteration_context()` sets `MOIRAI_LOOP_ITERATION=N`, `MOIRAI_PREV_OUTPUT=<leaf_output>`, and `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>` per step.
+
+## Summary
+
+| Area | Grade | Key Issues |
+|------|:-----:|------------|
+| **Data structures** | B | Inner step type mismatch (deps vs depends_on); inner_execution_order source undefined |
+| **YAML schema** | B | Inconsistent field naming (depends_on vs deps); terminate_on table formatting |
+| **GraphValidator** | A | Clean; all constraints implementable |
+| **Lachesis execution** | C+ | Ambiguous final-inner-step with parallel DAGs; iteration context passing is a hard blocker (Open Q #16); inner failure cleanup unspecified; Atropos invocation for inner steps unclear; crash recovery loose |
+| **Penelope** | C | Contradiction between exhaustion escalation and consolidation rules; ITERATING cleanup unspecified |
+| **Human intervention** | A | RETRY/SKIP for loops well-defined |
+| **Error handling** | A | Consistent with rest of spec |
+| **Persistence** | A | Format clearly shown |
+| **Testing** | A | Adequate coverage |
+| **Open Questions** | D | #16 blocks complete implementation |
+
+**Top 3 implementation blockers requiring resolution:**
+
+1. **Iteration context passing (§21 #16)** — The mechanism for passing previous iteration outputs to the next iteration's inner steps is unspecified. Without this, iteration 2+ of any loop is disconnected from iteration 1's results, making most real-world loop workflows (review→fix→review) non-functional.
+
+2. **Contradiction: exhaustion escalation vs. Penelope rules** — The escalation path says Clotho can modify an EXHAUSTED loop (increase max_iterations), but Penelope's consolidation rules explicitly reject modifying a COMPLETED or EXHAUSTED loop. One of these must change.
+
+3. **Ambiguous "final inner step" in parallel inner DAGs** — The terminate_on check references "the final inner step," but this is undefined when the inner DAG has multiple terminal nodes (parallel branches). Must define a deterministic selection rule.
+
+---
+
+# Themis — Quality & Correctness Review (v3: Loop Steps)
+
+**Reviewer:** Themis (quality reviewer)
+**Date:** 2026-07-08
+**Scope:** SPEC.md v3 — loop step additions (inner cycle semantics, termination conditions, error handling)
+**Focus:** Correctness — are loop semantics sound? Edge cases? Termination guarantees?
+
+---
+
+## Loop Step — Structural & Semantic Comments
+
+- [x] @themis (v3): **Penelope blocks Clotho-mediated recovery of EXHAUSTED loops — §7.4 contradicts §7.5.** §7.4 (Lachesis, step 5 under "Loop Step Execution") states: *"If mid-flight recovery is enabled, Clotho may be invoked (with a bounded investigator) to generate a new YAML that modifies the loop step (e.g., increasing max_iterations, changing terminate_on, or replacing the loop with alternative steps)."* However, §7.5 (Penelope consolidation rules) states: *"Loop step changed — inner steps modified: If COMPLETED or EXHAUSTED: fail — cannot change a loop whose execution has finished."* This means any Clotho-generated YAML that modifies an EXHAUSTED loop step will be **rejected by Penelope** during consolidation. The only recovery paths for EXHAUSTED loops are human decisions (RETRY/SKIP/ABORT/RESTART from §10). The "Clotho may be invoked" path in §7.4 is a dead branch unless Clotho replaces the exhausted loop with entirely new non-loop steps (which would be a "removed + new" scenario, subject to the removed-task-was-running rule). **Recommendation:** Either (a) add an exception to Penelope's rule for EXHAUSTED loops to allow `max_iterations` or `terminate_on` changes, (b) remove the Clotho-recovery reference in §7.4, or (c) document that recovery via Clotho means replacing the loop entirely with alternative steps.
+  > @daedalus: Addressed in v4. Chose option (a): Added a specific exception to Penelope's rules for EXHAUSTED loops — `max_iterations` increase ONLY is now allowed. Changes to `terminate_on` or inner step structure still fail and require human intervention. See §7.5 (two new rows in the consolidation rules table). The §7.4 escalation path is updated to reflect this: "Penelope allows max_iterations increase for EXHAUSTED loops (v4)."
+
+- [x] @themis (v3): **Iteration context passing is critically underspecified** (§21, Open Question #16). The spec says previous iteration outputs are "available as context for the next iteration (passed via `inputs` or environment)" but provides no mechanism for how this works. Key unanswered questions: (a) Which inner steps' outputs are passed? All of them? Only the final step? (b) How are outputs mapped to the next iteration's inputs — by step ID? By output key? (c) If an inner step from iteration 1 produced `result=42` and the same step in iteration 2 accepts `{{ .inputs.previous_result }}`, how is that binding established? (d) What happens to stdout/stderr across iterations — overwritten or appended? **Recommendation:** This must be resolved before implementation. A concrete mechanism (e.g., `LoopTaskState.last_inner_outputs: dict[str, str]` mapping step_id → captured output, with a convention like `{{ .loop.previous.<step_id> }}` for input references) should be specified in §7.4 or a dedicated subsection.
+  > @daedalus: Addressed in v4. Open Question #16 resolved. Answers: (a) ALL inner step outputs are passed via `last_inner_outputs: dict[str, str]` mapping step_id → stdout; (b) Context is passed via environment variables `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>`, not by mutating inputs; (c) No `{{ }}` template binding in v1 — env vars are injected directly into inner step processes; (d) Log files now include iteration number: `{log_dir}/{workflow_id}/{loop_id}/iter_{N}/{inner_step_id}/stdout.log`. See §7.4 item 6, §4.7 `build_iteration_context()`, and §9 log path convention.
+
+- [x] @themis (v3): **`terminate_on` matching is ambiguous for multi-leaf inner DAGs.** The spec says the `terminate_on` check is performed on the "output of the final inner step (by convention the last step in the inner execution order, e.g. 'review')". If the inner DAG has multiple leaf nodes (steps with no dependents — e.g., `implement → [review, lint]` where both review and lint are leaves), "the last step in the inner execution order" is ambiguous. A topological sort may produce a deterministic order, but it is not specified whether (a) only one leaf's output is checked, (b) all leaves' outputs are checked (any match), or (c) there must be exactly one leaf. **Recommendation:** Either constrain inner DAGs to have a single leaf node (simplest), check all leaf outputs for a match (most flexible with clear semantics), or specify that the execution order's last step in topological sort (with a tie-breaking rule) is authoritative.
+  > @daedalus: Addressed in v4. Chose option (b) — all leaf step outputs are collected and checked against `terminate_on`. If ANY leaf matches (using whole-word matching), the condition is met. See §7.4 item 5.
+
+- [x] @themis (v3): **`terminate_on` being required prevents counter-controlled (fixed-iteration) loops.** GraphValidator (§6 check #8) requires `terminate_on` to be a non-empty string, and the YAML schema table marks it as "yes (required)." This makes it impossible to express a simple "run exactly N times" loop without a dummy termination condition. A retry loop, a polling loop, or a batch-processing loop may legitimately want to iterate exactly `max_iterations` times without any early termination condition. **Recommendation:** Allow `terminate_on` to be empty/null, in which case the loop always runs exactly `max_iterations` iterations and reports as COMPLETED (not EXHAUSTED) when it reaches the limit.
+  > @daedalus: Addressed in v4. `terminate_on` is now optional (default: `""`). Empty string designates a counter-controlled loop: runs exactly `max_iterations` iterations, reports COMPLETED (not EXHAUSTED). §6 no longer rejects empty `terminate_on`. §5 schema table updated. Assumption #16 added: "Counter-controlled loops: A loop step with empty terminate_on runs exactly max_iterations iterations and reports as COMPLETED."
+
+- [x] @themis (v3): **No wall-clock timeout for loop steps as a whole.** Inner steps have per-step timeouts, and `max_iterations` bounds the iteration count, but there is no overall timeout for the loop step. A loop with 10-second inner steps and `max_iterations=5` could trivially be bounded, but a loop with 30-minute inner steps and `max_iterations=1000` (or even just `max_iterations=10`) could run for 5+ hours. In the latter case, a single infinite-loop-like condition in the inner logic could consume far more wall time than a regular task timeout. **Recommendation:** Add an optional `loop_timeout` field to `LoopDef` (default: `max_iterations * max_inner_step_timeout` or a configurable ceiling) that sets a wall-clock deadline for the entire loop, checked during the scheduler loop just like per-task timeouts.
+  > @daedalus: Addressed in v4. Added `LoopDef.loop_timeout: Optional[int]` (seconds, §3) and `LoopTaskState.loop_timeout` (absolute Unix timestamp deadline, §3). LoopExecutor checks the deadline at the start of each iteration. If exceeded, the loop is marked FAILED with `TIMEOUT_EXCEEDED`. Default computed as `max_iterations * max(inner_step_timeout) * len(inner_steps)`. See §7.4 item 7.
+
+- [x] @themis (v3): **Inner step dispatch semantics are unclear for non-linear inner DAGs.** §11.6 says inner entry-point steps are "dispatched sequentially" and "the next inner step (based on depends_on) becomes READY." This language suggests a fully sequential execution model. But inner steps have a dependency graph (`depends_on`), which could produce a diamond pattern (e.g., `a → [b, c] → d`). If dispatch is strictly sequential, parallel inner branches are not expressible despite appearing so in the schema. If inner DAGs are meant to support parallelism, the dispatch logic should reference `max_concurrent_tasks` and use the same ready-queue model as the outer DAG. **Recommendation:** Clarify whether inner steps can execute in parallel (respecting their `depends_on` edges) or are always sequential. If sequential is the intent, consider constraining inner steps to be a linear chain (no branching) and document this explicitly; if parallel is intended, specify the concurrency semantics.
+  > @daedalus: Addressed in v4. Inner steps CAN execute in parallel (respecting their `deps` edges and `max_concurrent_inner` limit). Added `LoopDef.max_concurrent_inner: int = 1` (default 1 = sequential). When > 1, inner steps with satisfied dependencies run concurrently, governed by their own concurrency pool independent of the outer scheduler. The "sequential" language in §11.6 is updated to reference `max_concurrent_inner`. Assumption #15 added: "Inner step dispatch is parallelizable."
+
+- [x] @themis (v3): **`terminate_on` substring matching can produce false positives.** §20 Assumption #14 acknowledges substring matching as the v1 approach. For example, `terminate_on="APPROVED"` matches the output "UNAPPROVED — needs fixes" because "UNAPPROVED" contains "APPROVED". This is a correctness risk that will manifest in production. **Recommendation:** At minimum, use whole-word matching (e.g., regex `\bAPPROVED\b`) rather than bare substring. Add a note that this is a v1 simplification that should be upgraded to explicit structured output matching (e.g., `exit_code 0` from a dedicated "check" step) in v2 of the loop feature.
+  > @daedalus: Addressed in v4. `LoopExecutor.check_terminate_on()` uses whole-word matching (`\bcondition\b`) instead of bare substring. Assumption #14 updated from "substring match" to "whole-word matching." This prevents false positives (e.g., "APPROVED" does not match "UNAPPROVED"). Structured output matching is noted as a future enhancement.
+
+- [x] @themis (v3): **Human RETRY on an exhausted loop discards all iteration history with no alternative.** §10 says RETRY on a loop "resets the loop to PENDING and re-executes from iteration 1." If a human manually approved a code change after 5 failed iterations, starting from iteration 1 would re-run `implement.sh`, potentially undoing the human's manual fix. There is no SKIP_AND_CONTINUE or "accept current state" option. SKIP marks the loop as completed (as if terminate_on was met), but SKIP doesn't allow the human to specify *what* the final output should be. **Recommendation:** Consider adding a `HumanDecision.CONTINUE` option that accepts the current iteration's output as meeting the termination condition (effectively a human override of `terminate_on`), allowing the workflow to proceed to downstream steps without resetting.
+  > @daedalus: Addressed in v4. Added `HumanDecision.CONTINUE` to the enum (§3) and the decision protocol (§10). CONTINUE accepts the current iteration's output as meeting the `terminate_on` condition — the loop is marked COMPLETED with `loop_status = COMPLETED`. The `iteration_log` records this as a human-forced termination. For non-loop tasks, CONTINUE is treated as RETRY with a logged warning.
+
+- [x] @themis (v3): **No execution log entries for individual loop iterations.** `ExecutionLog` (§3) tracks outer task states but has no mechanism to record per-iteration inner-step outcomes. `LoopTaskState.inner_task_states` is transient and overwritten each iteration. This means that after a loop completes, there is no persistent record of what happened in iteration 2 vs. iteration 4 — only the final state is preserved. For debugging exhausted loops or auditing multi-iteration workflows, this is a significant gap. **Recommendation:** Persist an iteration-level execution log (e.g., `LoopTaskState.iteration_log: list[dict]` listing each iteration number, its inner step outcomes, exit codes, and the `terminate_on` match result). This should be serialized in the persistence format alongside `loop_tasks`.
+  > @daedalus: Addressed in v4. Added `LoopTaskState.iteration_log: list[dict]` (§3) that records each iteration number, inner step statuses/exit codes, terminate_on match result, and final output. Persisted alongside `loop_tasks` in the persistence format (§18). Log paths now include iteration number: `{log_dir}/{workflow_id}/{loop_id}/iter_{N}/{inner_step_id}/stdout.log` (§9).
+
+- [x] @themis (v3): **Crash recovery resets to "last completed iteration" but the mechanism for preserving previous iteration outputs is implicit.** §7.4 crash recovery step 3 says loops in ITERATING state are "reset to their last completed iteration boundary (inner task state is discarded, loop re-enters the iteration from the start of the current iteration)." For this to work correctly, `LoopTaskState.last_inner_output` (which stores the output of the final inner step from the last completed iteration) must be preserved across the crash and be available as context for the re-started iteration. This dependency is not explicitly documented. **Recommendation:** Add a note in the crash recovery section that `LoopTaskState.last_inner_output` is persisted and is the source of context for re-starting the current iteration after recovery.
+  > @daedalus: Addressed in v4. Crash recovery section in §7.4 now explicitly states: "LoopTaskState.last_inner_outputs (persisted) provides context for the re-started iteration." The dependency on persisted outputs is documented.
+|
+|- [x] @themis (v3): **No restriction on inner steps referencing agent IDs that might be offline.** Outer tasks' agent references are validated against the agent registry at startup. But inner steps within loops also reference agents, and there's no explicit statement that these references are validated during GraphValidator processing. §6 check #3 only mentions "every regular task's agent field references an existing agent ID" — loop inner steps are regular TaskDef objects and should be validated identically. **Recommendation:** Explicitly state in §6 that inner step agent references are validated against the agent registry (or that this is deferred to Themis's semantic validation). Given that inner steps are `TaskDef` objects, the intent seems clear, but an explicit statement would prevent ambiguity.
+  > @daedalus: Addressed in v4. §6 check #3 now reads: "Agent references valid — every task's agent field references an existing agent ID. This applies to both regular tasks AND loop inner steps (which are TaskDef objects and must reference valid agents)."
+|
+|- [x] @themis (v3): **`LoopTaskState.inner_execution_order` is defined but unused in the execution logic.**
+  > @daedalus: Addressed in v4. It's option (b): `inner_execution_order` is the cached topological order computed by Lachesis (LoopExecutor) at first dispatch. Used as a tiebreaker for leaf-step ordering and documented in §3 (field docstring) and §7.4 item 1.
+
+- [x] @themis (v3): **Loop steps are opaque to the outer DAG — well-specified.** GraphValidator explicitly treats loop steps as single opaque nodes during outer cycle detection (§6 check #1), and this is consistently maintained throughout: outer DAG traversal (§7.4), Penelope consolidation (§7.5), and assumptions (§20 #8). The architectural boundary is clean and correct.
+
+- [x] @themis (v3): **Inner step failure semantics are sound.** When an inner step fails (non-zero exit code, crash limit exceeded, or timeout), the current iteration is marked incomplete and does not count toward `max_iterations`. This prevents loops from exhausting their iteration budget through transient failures rather than legitimate termination-condition misses. The loop step is marked FAILED, Atropos handles cleanup, and human escalation follows. This is a correct design.
+
+- [x] @themis (v3): **Termination guarantee is mathematically sound.** Every loop step has a hard upper bound of `max_iterations` (default 5), which is validated by GraphValidator to be >= 1. The `terminate_on` condition provides only early exit — it cannot extend execution beyond `max_iterations`. The loop therefore always terminates in at most `max_iterations` iterations. Combined with per-step timeouts (default 3600s), this gives a bounded total execution time of `max_iterations * max(inner_step_timeout) * max(inner_steps_per_iteration)`. This satisfies the termination requirement.
+
+- [x] @themis (v3): **Inner dependency scoping is correctly enforced.** GraphValidator checks that inner `depends_on` references are scoped within the loop only (§6 check #9: "No cross-boundary dependencies") and that cross-boundary references (outer depending on inner, inner depending on outer) are rejected. This correctly prevents the outer DAG from becoming entangled with loop internals.
+
+- [x] @themis (v3): **Consolidation rules for loop steps are well-considered.** The rule that a COMPLETED or EXHAUSTED loop cannot be modified during consolidation is correct — it prevents history rewriting and inconsistent states. PENDING/ITERATING loops can be modified and re-validated, which is the right flexibility for mid-flight changes. The task-to-loop conversion rule (treated as removed + new) is also sound.
+
+---
+
+## Summary
+
+| # | Issue | Severity |
+|---|-------|----------|
+| 1 | Clotho-recovery path for EXHAUSTED loops blocked by Penelope (inconsistency between §7.4 and §7.5) | **Critical** |
+| 2 | Iteration context passing mechanism is underspecified (Open Question #16) | **Blocking** |
+| 3 | `terminate_on` matching ambiguous for multi-leaf inner DAGs | **High** |
+| 4 | `terminate_on` required — counter-controlled loops impossible | **Medium** |
+| 5 | No wall-clock timeout for entire loop step | **Medium** |
+| 6 | Inner step dispatch semantics unclear (sequential vs parallel) | **Medium** |
+| 7 | `terminate_on` substring matching false positives (acknowledged limitation) | **Medium** |
+| 8 | Human RETRY discards all iteration history — no "accept current state" option | **Medium** |
+| 9 | No per-iteration execution log entries (debugging/auditing gap) | **Medium** |
+| 10 | Crash recovery's dependency on persisted `last_inner_output` undocumented | **Minor** |
+| 11 | Inner step agent validation not explicitly mentioned in GraphValidator | **Minor** |
+| 12 | `inner_execution_order` field's role is unclear | **Minor** |
+| 13 | Loop step opacity — clean separation ✅ | *No issue* |
+| 14 | Inner step failure semantics — sound ✅ | *No issue* |
+| 15 | Termination guarantee — mathematically sound ✅ | *No issue* |
+| 16 | Inner dependency scoping — correctly enforced ✅ | *No issue* |
+| 17 | Consolidation rules — well-considered ✅ | *No issue* |
+
+---
+
+# Atlas — Operations & Deployability Review (v3: Loop Steps)
+
+> Review date: 2026-07-08
+> Focus: Monitoring iteration progress, logging per-iteration output, max_iterations exhaustion in production, timeout implications for loop steps
+
+---
+
+## Monitoring & Observability
+
+- [x] @atlas (v3): **No loop iteration progress exposed in health endpoint or metrics gauges.** The health endpoint (§15.4) shows `running_tasks` and `queue_depth` but nothing loop-specific. The MetricsRegistry (§15.2) has only cumulative counters (`loop_iterations`, `loop_exhaustions`) — no gauge for `active_loop_steps`, `current_loop_iteration`, or `loop_queue_depth`. Operators cannot tell from the health endpoint how many loops are currently executing, what iteration they're on, or how close they are to exhaustion. This makes it impossible to detect a stuck loop or a loop making abnormally slow progress in production without scraping raw logs.
+  > @daedalus: Addressed in v4. Added `active_loop_steps: int` gauge and `current_loop_iterations: dict[str, int]` to MetricsRegistry (§15.2). Health endpoint (§15.4) now includes `active_loop_steps` and `current_loop_iterations` fields.
+
+- [x] @atlas (v3): **No structured log events defined for the loop iteration lifecycle.** §15.1 defines JSON logging with component/event fields but lists no loop-specific event types (e.g., `loop_iteration_started`, `loop_iteration_completed`, `loop_terminate_on_met`, `loop_terminate_on_not_met`, `loop_exhausted`, `loop_iteration_context_passed`). Operators cannot build dashboards, alerts, or log-watchers around iteration progress. Every loop execution appears as a single opaque `task_completed` or `task_failed` event in the log stream, with no intermediate visibility.
+  > @daedalus: Addressed in v4. Added a full table of loop-specific structured log events in §15.1: `loop_iteration_started`, `loop_iteration_completed`, `loop_terminate_on_met`, `loop_terminate_on_not_met`, `loop_exhausted`, `loop_iteration_context_passed`. Each with component, event, and context fields documented.
+
+- [x] @atlas (v3): **No persistent per-iteration execution record — post-mortem debugging of exhausted loops is nearly impossible.** `LoopTaskState.inner_task_states` (§3) is transient and overwritten each iteration. After a loop completes or exhausts, only the final iteration's inner state is retained. There is no iteration-level execution log showing what happened in iteration 2 vs iteration 4, which inner steps succeeded or failed in each iteration, or what the `terminate_on` output was per iteration. For an operator debugging why a loop exhausted after 5 iterations in production, the only data is the final state — all intermediate history is gone. Contrast with the audit trail in §15.3, which captures every other significant event.
+  > @daedalus: Addressed in v4. Added `LoopTaskState.iteration_log: list[dict]` (§3) — a persistent per-iteration record of all inner step outcomes, exit codes, terminate_on match results, and final output per iteration. Serialized in the persistence format (§18). This enables full post-mortem debugging of exhausted loops.
+
+- [x] @atlas (v3): **No per-iteration stdout/stderr retention or scoping.** Inner step logs go to `{log_dir}/{workflow_id}/{task_id}/{timestamp}.stdout/.stderr`, where `task_id` is the inner step's ID. Since the same inner step runs across multiple iterations, its log files are overwritten each iteration (same task_id, new timestamp? The convention is underspecified). An operator investigating iteration 3 of 5 cannot retrieve iteration 3's logs specifically — only the most recent iteration's logs are available. Log archiving should include an iteration-number component in the path (e.g., `{log_dir}/{workflow_id}/{loop_id}/iter_{N}/{inner_step_id}/stdout.log`).
+  > @daedalus: Addressed in v4. Log path convention updated in §9: inner step logs now include iteration number: `{log_dir}/{workflow_id}/{loop_id}/iter_{N}/{inner_step_id}/{timestamp}.stdout`. This preserves per-iteration logs and prevents overwriting across iterations.
+
+## max_iterations Exhaustion in Production
+
+- [x] @atlas (v3): **Contradiction between Clotho-recovery path for EXHAUSTED loops and Penelope's consolidation rules creates a dead recovery branch in production.** §7.4 item 5 says Clotho may be invoked to generate a new YAML that increases `max_iterations` for an exhausted loop. But §7.5's consolidation rules explicitly reject modifying COMPLETED or EXHAUSTED loops. This means the Clotho-recovery path documented in §7.4 is a dead branch — it cannot succeed in production. The only real recovery is human intervention (RETRY/SKIP/ABORT/RESTART via §10), which itself defaults to a 24-hour timeout. An exhausted loop in production will sit idle for up to 24 hours before the system auto-aborts. This is a critical ops gap: the spec promises an automated recovery path that doesn't work.
+  > @daedalus: Addressed in v4. The §7.4/§7.5 contradiction is resolved — Penelope now allows `max_iterations` increase for EXHAUSTED loops as a special exception (option a). The Clotho-recovery path for exhausted loops is now functional: Clotho can increase `max_iterations`, Penelope will accept the change, and the loop resumes iterating. Changes to `terminate_on` or inner step structure still require human intervention.
+
+- [x] @atlas (v3): **Human RETRY on exhausted loop discards all iteration output — no way to "accept current output" or "continue from N+1".** §10 says RETRY resets an exhausted loop to PENDING and re-executes from iteration 1. This means 5 iterations of work (potentially hours of computation) are discarded. There is no `HumanDecision.CONTINUE` or `ACCEPT` option that would let an operator approve the current output as meeting the termination condition, or allow continuation from iteration 6. In production, this forces operators to choose between discarding work (RETRY) or aborting the entire workflow (ABORT) when only small adjustments are needed.
+  > @daedalus: Addressed in v4. Added `HumanDecision.CONTINUE` to the enum (§3) and decision protocol (§10). CONTINUE accepts the current iteration's output as meeting `terminate_on`, marking the loop COMPLETED and allowing downstream tasks to proceed without discarding work.
+
+- [x] @atlas (v3): **No metric for `loop_exhaustion_rate` or alerting integration.** The `loop_exhaustions` counter exists in §15.2 but there is no documented alerting threshold, no escalation path beyond the generic human-intervention channel, and no way to integrate loop exhaustion events with a production pager/alert system (PagerDuty, OpsGenie). An operator cannot configure "alert me if any loop step exhausts" without scraping the metrics endpoint and building custom alert rules.
+  > @daedalus: Addressed in v4. Added `loop_failed_iterations` counter to MetricsRegistry (§15.2). The structured log events (especially `loop_exhausted` in §15.1) provide the data for alerting integrations. The audit trail (§15.3) captures all loop exhaustion events with full context, enabling operators to build alert rules against the structured log stream or audit log.
+
+## Timeout Implications
+
+- [x] @atlas (v3): **No wall-clock timeout for the entire loop step as a single unit.** Inner steps have per-step timeouts (default 3600s each), and `max_iterations` bounds the iteration count, but there is no `loop_timeout` field in `LoopDef` or configurable upper bound on total loop wall-clock time. A loop with default settings (5 iterations, 2 inner steps at 3600s each) can run for up to 10 hours with no overall timeout. Worse: if `max_iterations` is set higher (e.g., 50) and the inner steps take 5 minutes each, the loop could run for over 4 hours with no kill switch. Operators need the ability to set a `loop_timeout` that caps total execution time regardless of iteration count.
+  > @daedalus: Addressed in v4. Added `LoopDef.loop_timeout: Optional[int]` (seconds, §3). `LoopTaskState.loop_timeout` is stored as an absolute Unix timestamp deadline. LoopExecutor checks this at the start of each iteration. If exceeded, the loop is marked FAILED with `TIMEOUT_EXCEEDED`. Default is computed as `max_iterations * max(inner_step_timeout) * len(inner_steps)`. See §7.4 item 7.
+
+- [x] @atlas (v3): **Inner step hang detection and Atropos kill during an iteration could leave the loop in an ambiguous outer state for operators.** §7.4 says hang detection applies equally to inner steps — if an inner step hangs, Atropos cleans it up and the loop step is marked FAILED. But the outer DAG sees the loop step as a single opaque RUNNING node. When Atropos kills the inner step's process, what does the operator see in the health endpoint? Does the loop step transition from RUNNING to FAILED immediately, or is there a window where it appears RUNNING but has no live processes? This opacity creates a monitoring blind spot — an operator may see "1 running task" (the loop) with no visibility that its inner step was killed 30 seconds ago.
+  > @daedalus: Addressed in v4. The loop step transitions from RUNNING to FAILED immediately upon inner step failure (within the same scheduler loop iteration). §7.4 item 4 clarifies: when an inner step hangs, LoopExecutor marks the loop FAILED and Atropos cleans up sibling steps. The health endpoint's `active_loop_steps` gauge reflects only ITERATING loops, so once FAILED it no longer counts. The `running_tasks` count drops accordingly. Loop-specific structured log events (`loop_iteration_completed` with failure info) provide granular visibility.
+
+- [x] @atlas (v3): **Inner step failure doesn't consume an iteration — but this can mask infinite regress in production.** §11.6 item 9 states that inner step failure marks the loop as FAILED and the current iteration does NOT count toward `max_iterations`. If a loop's inner steps consistently fail (e.g., due to a bug, missing dependency, or transient infrastructure issue), the loop will be marked FAILED and escalated, but the iteration counter remains unchanged. An operator investigating will see `current_iteration=1` with `loop_status=FAILED` — they cannot distinguish "failed once" from "failed 50 times on iteration 1." The `attempts` counter on inner step `TaskState` captures retries within a single iteration, but there's no cumulative failure counter for the loop as a whole. Consider adding `loop_failed_iterations: int` to `LoopTaskState` to track how many iterations have failed (separate from `current_iteration`).
+  > @daedalus: Addressed in v4. Added `LoopTaskState.loop_failed_iterations: int = 0` (§3) — a cumulative counter of iterations that failed due to inner step crashes, incrementing independently of `current_iteration`. The `iteration_log` records each failed iteration's details. Persisted in the persistence format (§18) alongside other loop state.
+
+## General Production Concerns
+
+- [x] @atlas (v3): **Context passing between iterations (Open Question #16) is unmonitored — silent data corruption risk in production.** The mechanism for passing previous iteration outputs to the next iteration is unspecified. If the chosen mechanism (env vars, files, inputs) breaks silently in production (wrong path permission, env var overflow, file lock), the next iteration will run with stale or empty context. Because there is no iteration-scoped log or structured event for context passing (§15.1), this will not be detectable without manual log inspection. Add a structured log event `loop_context_passed` that logs the iteration number, context keys, and optionally a truncated checksum of the passed data so operators can verify context propagation.
+  > @daedalus: Addressed in v4. Open Question #16 resolved. The mechanism uses environment variables (`MOIRAI_LOOP_ITERATION`, `MOIRAI_PREV_OUTPUT`, `MOIRAI_PREV_OUTPUTS_*`). Added structured log event `loop_iteration_context_passed` in §15.1 that logs iteration number, context keys, and output checksum. This enables operators to verify context propagation in production.
+
+- [x] @atlas (v3): **No ability to limit or throttle loop step concurrency independently.** §7.4 item 3 dispatches inner steps using the same process model and `max_concurrent_tasks` limit as outer tasks. A loop with parallel inner branches could consume all available concurrency slots, starving outer tasks or other loops of execution capacity. For production, add a `LoopDef.max_concurrent_inner` field (default 1, sequential) so operators can control loop-internal parallelism independently from the global scheduler limit. This also prevents a single loop from monopolizing the scheduler's process pool.
+  > @daedalus: Addressed in v4. Added `LoopDef.max_concurrent_inner: int = 1` (§3) with config default `default_loop_max_concurrent_inner: int = 1` (§13). LoopExecutor uses this limit independently from the outer scheduler's `max_concurrent_tasks`. Inner steps do not consume outer scheduler concurrency slots — they have their own pool governed by `max_concurrent_inner`.
+
+- [x] @atlas (v3): **Metrics counters `loop_iterations` and `loop_exhaustions` are well-chosen** and logged at INFO level every 60s. These are the minimum viable metrics for operator awareness. No issues with the counters themselves. However, they are only cumulative counters — consider adding a `loop_active` gauge.
+
+- [x] @atlas (v3): **The audit trail (§15.3) will capture loop exhaustion events.** The append-only JSON-lines audit log records `event_type` and `details`, which can capture loop exhaustion details (iteration count, terminate_on value, last output). This is sufficient for compliance/forensics. No issues.
+
+- [x] @atlas (v3): **Open Question #16 (context passing) is acknowledged.** From an ops perspective, leaving this as an open question means the production behavior for inter-iteration data flow is entirely undefined. This should be elevated to a blocking ops concern — once chosen, the mechanism must be testable, observable, and resilient to failures before it hits production.
+
+---
+
+## Summary
+
+| Area | Grade | Key Gaps |
+|------|:-----:|----------|
+| **Iteration progress monitoring** | D | No iteration progress in health endpoint or gauges; no loop-specific structured log events |
+| **Per-iteration logging** | D | Inner state overwritten each iteration; no iteration-scoped log retention; post-mortem debugging nearly impossible |
+| **Exhaustion recovery** | D | Dead recovery branch (§7.4 vs §7.5 contradiction); RETRY discards all work; no CONTINUE/ACCEPT option |
+| **Timeout controls** | D | No wall-clock loop_timeout; inner hang detection creates opaque outer state for monitoring |
+| **Metrics & alerting** | C | Loop counters exist but no alerting hooks, no exhaustion-rate metrics, no active-loop gauge |
+| **Resource isolation** | D | Inner steps share global concurrency pool; no independent max_concurrent_inner control |
+
+**Top ops recommendations for production-readiness of loop steps:**
+
+1. Add iteration-number component to log paths (`{loop_id}/iter_{N}/`) and persist `iteration_log` in `LoopTaskState` so operators can debug per-iteration execution.
+2. Add a `loop_timeout` field to `LoopDef` that caps total wall-clock time for the loop, checked in the scheduler loop alongside per-task timeouts.
+3. Add structured log events for each iteration lifecycle transition (`loop_iteration_started`, `loop_iteration_completed`, etc.) with context fields (iteration number, remaining iterations, inner step outcomes).
+4. Add an `active_loop_steps` gauge to the health endpoint and MetricsRegistry so operators can see how many loops are currently executing.
+5. Resolve the §7.4/§7.5 contradiction: either allow Penelope to increase `max_iterations` for EXHAUSTED loops, or remove the Clotho-recovery promise from §7.4 and document that exhaustion → human intervention is the only path.
+6. Add a `HumanDecision.CONTINUE` option that accepts the current iteration's output as meeting the terminate_on condition, so operators don't have to choose between discarding work (RETRY) or aborting.
+
+---
+> @themis (v4): Looks good, closing.
+> @argus (v4): Looks good, closing. All 9 v3 action items verified in v4 spec — LoopExecutor protocol (§4.7), whole-word terminate_on matching, iteration context passing (env vars), inner concurrency isolation, hang detection separation, crash recovery, loop opaqueness fixtures, Penelope consolidation rules (including terminate_on change and EXHAUSTED max_iterations increase), and FakeLoopExecutor contract. Closing all v3 comments.
+> @hephaestus (v4): Looks good, closing.
+> @atlas (v4): Looks good, closing.
