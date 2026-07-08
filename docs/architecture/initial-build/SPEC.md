@@ -2030,7 +2030,8 @@ The following defines the Minimum Viable Product (MVP) — the smallest set of f
 | Penelope (§7.5) — workflow consolidation | P0 | Required for mid-flight changes (hanging task recovery) |
 | Atropos (§7.6) — process cleanup | P0 | Required for task lifecycle management |
 | ProcessManager (§4.3) + subprocess dispatch model (§9) | P0 | How tasks actually run |
-| PersistenceBackend (§4.2) + file-based persistence (§18) | P0 | Required for scheduler state, crash recovery |
+| PersistenceBackend (§4.2) — in-memory backend only (MemoryBackend) | P0 | Required for scheduler state. File-based and SQLite backends are post-MVP |
+| File-based persistence (§18) | P2 | Deferred — in-memory is sufficient for bootstrap |
 | CLI (§7.8) — `moirai run` (ad-hoc) + `moirai status` + `moirai cancel` | P0 | Minimum user interface |
 | Clotho (§7.1) — LLM-powered YAML generation | P0 | The only way new workflows enter the system |
 | LoopExecutor (§4.7) + loop steps (§7.4 inner steps) | P0 | Required for dev-review-fix cycles |
