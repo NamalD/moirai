@@ -66,12 +66,15 @@ All agents working on this project follow these rules:
    | Profile | Git Author |
    |---------|-----------|
    | `daedalus` / `default` | NamalD <namald@users.noreply.github.com> |
-   | `hephaestus` | Claude Code <claude-code@namald.users.noreply.github.com> |
    | `themis` | Themis <themis@namald.users.noreply.github.com> |
    | `argus` | Argus <argus@namald.users.noreply.github.com> |
    | `atlas` | Atlas <atlas@namald.users.noreply.github.com> |
 
    Scripts live at `~/.hermes/scripts/set-git-author-*.sh` and are referenced in each profile's `terminal.shell_init_files` in their `config.yaml`.
+
+   **Exception — `claude-dev`:** The dev agent (Claude Code, dispatched as `claude --print`) doesn't run through a Hermes profile, so it doesn't get a dedicated identity. It commits as the repo's default local git identity (`NamalD <namald@users.noreply.github.com>`) with a `Co-Authored-By: Claude Sonnet 5 <noreply@anthropic.com>` trailer — Claude Code's normal default commit behavior — the same pattern used in `f226cf4`.
+
+   This table is the single source of truth for agent git authorship — `CLAUDE.md` and `SPEC.md §24` reference it rather than duplicating it.
 5. **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
    ```
    [Phase 1] Implement YAML schema validation in Themis (#3)
@@ -102,6 +105,6 @@ moirai/
 
 ## Bootstrapping Goal
 
-The first real Moirai workflow should be a dev-review loop that builds Moirai itself. The `dev-workflow` template (§7.7 of the spec) defines this: Clotho generates YAML from a prompt, Themis validates, Lachesis dispatches tasks to Hephaestus (dev) and Themis (review) in a loop.
+The first real Moirai workflow should be a dev-review loop that builds Moirai itself. The `dev-workflow` template (§7.7 of the spec) defines this: Clotho generates YAML from a prompt, Themis validates, Lachesis dispatches tasks to `claude-dev` (dev) and Themis (review) in a loop.
 
 See [`docs/architecture/initial-build/SPEC.md`](docs/architecture/initial-build/SPEC.md) for the full specification.

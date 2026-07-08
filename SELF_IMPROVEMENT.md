@@ -18,7 +18,7 @@ Themis validates workflow                   # Deterministic YAML → StateMachin
     │
     ▼
 Lachesis dispatches tasks:                  # Dev-review-fix loop
-  ├── Hephaestus → implements the feature
+  ├── claude-dev → implements the feature
   ├── Themis → reviews the changes
   └── LoopExecutor → manages iterations
     │
@@ -66,7 +66,7 @@ Once all phases are complete, the cycle becomes fully autonomous:
 3. Themis validates it
 4. Lachesis dispatches agent tasks to implement the feature
 5. LoopExecutor runs review cycles until APPROVED
-6. Each agent commits with its own name and `@namal.dev` email
+6. Each agent commits with its own git identity — see `CONTRIBUTING.md`'s authorship table
 7. Moirai moves the issue on the project board *(requires Issue #10)*
 8. Loop — pick the next issue
 

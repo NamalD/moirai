@@ -48,13 +48,7 @@ These apply to every agent (human or AI) committing to this repo — see `CONTRI
 
 - Commit and push **every** doc or code change individually — don't batch unrelated changes into one commit.
 - Work directly off `main`; no feature branches for doc changes, agents work sequentially to avoid merge conflicts.
-- Each agent sets its own git identity before committing (name + `@namal.dev` email), e.g.:
-  ```bash
-  export GIT_AUTHOR_NAME="Hephaestus"
-  export GIT_AUTHOR_EMAIL="hephaestus@namal.dev"
-  export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
-  export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
-  ```
+- Each agent sets its own git identity before committing. `CONTRIBUTING.md`'s agent git authorship table is the single source of truth for which identity maps to which agent/profile — check there rather than assuming.
 - Commit messages reference the GitHub issue and a `[Phase N]` tag, e.g. `[Phase 1] Implement YAML schema validation in Themis (#3)`.
 - Spec is at `docs/architecture/initial-build/SPEC.md`; its review history is `docs/architecture/initial-build/comments.md`. Future architecture docs go under `docs/architecture/<topic>/`. Implementation code lives at repo root (`moirai/`, `tests/`).
 - Self-improvement loop context (GitHub Issues backlog, phase tracking, project board) is in `SELF_IMPROVEMENT.md`.

@@ -1139,7 +1139,7 @@ tasks:
   - id: "implement"
     type: "agent"
     agent: "claude-dev"
-    command: "claude --print --project {{ .project }} --prompt \"{{ .prompt }}\""
+    command: "claude --print --permission-mode bypassPermissions \"{{ .prompt }}\""
     deps: []
     max_retries: 2
   
@@ -1156,7 +1156,7 @@ tasks:
       - id: "fix"
         type: "agent"
         agent: "claude-dev"
-        command: "claude --print --project {{ .project }} --prompt \"Address review feedback\""
+        command: "claude --print --permission-mode bypassPermissions \"Address review feedback\""
         deps: ["review"]
 
     - id: "deploy"
@@ -1236,8 +1236,8 @@ Agents are registered via a YAML configuration file at a well-known path (`~/.mo
 agents:
   - id: "claude-dev"
     name: "Claude Code"
-    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks."
-    command: "claude --print"
+    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks. Runs unattended (--permission-mode bypassPermissions), so work_dir must not expose secrets and ProcessManager must not pass its environment through unfiltered — see §9."
+    command: "claude --print --permission-mode bypassPermissions"
     work_dir: "{{project}}"
     max_concurrent_tasks: 1
     tags: [dev, implementation]
@@ -1271,6 +1271,8 @@ The registry is passed as `known_agents` to Themis and used by Lachesis to resol
 ## 9. Task Dispatch / Process Model
 
 **Mechanism:** Tasks run as child OS processes spawned via `subprocess.Popen`. Each task is placed in its own process group via `os.setpgid()`.
+
+**Environment allowlisting:** `ProcessManager.spawn()` never passes `os.environ` through to a task subprocess unmodified. It builds the child's environment explicitly from an allowlist (`PATH`, `HOME`, and any loop-context `MOIRAI_*` vars the task needs — see §7.4 item 6) and nothing else. This matters because agents like `claude-dev` run with `--permission-mode bypassPermissions` (§8) — with no permission prompts and full Bash access, an unattended agent that inherited Moirai's own process environment could read out Moirai's secrets (`MOIRAI_LLM_API_KEY`, etc., §14) via a plain `printenv`. Restricting `work_dir` to a directory with no secrets on disk only closes the filesystem half of that exposure; env-var inheritance is the other half, and it's closed here. A task's env requirements beyond the allowlist must be declared explicitly (future: a per-task `env` field in the YAML schema, §5) rather than obtained implicitly through inheritance.
 
 **Lifecycle:**
 1. Lachesis determines a task is READY (all deps satisfied, concurrency slot available).
@@ -1585,6 +1587,8 @@ Implementations:
 - **env** (default dev): Reads from environment variables (`MOIRAI_LLM_API_KEY`, `MOIRAI_LLM_API_ENDPOINT`).
 - **file**: Reads from a JSON/YAML file at a configurable path (`secrets_file`), file permissions should be 0600.
 - **vault** (future): Pluggable interface for HashiCorp Vault, 1Password, etc.
+
+These secrets are Moirai's own — for calling its LLM. They must not leak into agent subprocesses; see the environment allowlisting rule in §9.
 
 ---
 
@@ -2060,7 +2064,7 @@ The following defines the Minimum Viable Product (MVP) — the smallest set of f
 The first real Moirai workflow should be a dev-review loop that uses Moirai to build Moirai itself. This means:
 1. A `dev-workflow` template (§7.7) that defines the standard development process
 2. The user provides the YAML (Clotho is stubbed for MVP)
-3. Themis validates, Lachesis dispatches, Hephaestus (dev) and Themis (review) in a loop
+3. Themis validates, Lachesis dispatches, `claude-dev` (dev) and Themis (review) in a loop
 4. Atropos handles any hanging task cleanup
 
 ## 24. Development Conventions
@@ -2069,19 +2073,10 @@ The following conventions govern agent interactions with the Moirai project:
 
 ### Version Tracking
 
-- **Every document change must be committed and pushed individually.** When Hephaestus updates the spec, commit and push. When Daedalus adds a comment response, commit and push. When Argus submits a review, commit and push.
+- **Every document change must be committed and pushed individually.** When Daedalus updates the spec, commit and push. When Argus submits a review, commit and push.
 - **Work off `main` branch** for now. No feature branches — we're small enough that linear history is fine.
 - **Agents run sequentially**, not in parallel. This avoids merge conflicts and ensures each agent works off the latest state.
-- **Agent git authorship (baked into profiles).** Each Hermes profile sets its own git author name and `@namal.dev` email automatically via `terminal.shell_init_files`:
-  | Profile | Git Author |
-  |---------|-----------|
-  | `daedalus` / `default` | NamalD <namald@users.noreply.github.com> |
-  | `hephaestus` | Claude Code <claude-code@namald.users.noreply.github.com> |
-  | `themis` | Themis <themis@namald.users.noreply.github.com> |
-  | `argus` | Argus <argus@namald.users.noreply.github.com> |
-  | `atlas` | Atlas <atlas@namald.users.noreply.github.com> |
-  
-  Agents do not need to set these manually — the env vars are exported at shell init via scripts in `~/.hermes/scripts/set-git-author-*.sh`. If you're adding a new agent profile, create the corresponding script and add it to the profile's `terminal.shell_init_files`.
+- **Agent git authorship (baked into profiles).** `CONTRIBUTING.md`'s agent git authorship table is the single source of truth for which git identity each agent/profile commits as (including the `claude-dev` exception, which doesn't run through a Hermes profile) — see it there rather than duplicating it here.
 - **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
   ```
   [Phase 1] Implement YAML schema validation in Themis (#3)
