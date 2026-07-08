@@ -2032,13 +2032,12 @@ The following defines the Minimum Viable Product (MVP) — the smallest set of f
 | ProcessManager (§4.3) + subprocess dispatch model (§9) | P0 | How tasks actually run |
 | PersistenceBackend (§4.2) — in-memory backend only (MemoryBackend) | P0 | Required for scheduler state. File-based and SQLite backends are post-MVP |
 | File-based persistence (§18) | P2 | Deferred — in-memory is sufficient for bootstrap |
-| CLI (§7.8) — `moirai run` (ad-hoc) + `moirai status` + `moirai cancel` | P0 | Minimum user interface |
-| Clotho (§7.1) — LLM-powered YAML generation | P0 | The only way new workflows enter the system |
+| Template system (§7.7) — `--template` support, runs pre-written YAML | P0 | Primary workflow entry for MVP. User writes YAML by hand or generates outside Moirai |
+| Clotho (§7.1) — LLM-powered YAML generation | P1 (stub) | Stubbed in MVP — returns a placeholder. Clotho is the first target for Moirai to build itself |
 | LoopExecutor (§4.7) + loop steps (§7.4 inner steps) | P0 | Required for dev-review-fix cycles |
-| Template system (§7.7) — basic `--template` support | P1 | Accelerates bootstrapping but not strictly required for first self-build |
 | Agent Registry (§8) — agent registration config | P1 | Required for any validation, but can start hardcoded |
 | Error recovery — retry loops, human intervention (§10) | P1 | Required for unattended operation |
-| Human intervention protocol (§10) | P2 | Stripped for MVP — user is at keyboard, re-run manually. No HumanNotifier, no polling, no decision channel. MVP exits on failure with error message |
+| Human intervention protocol (§10) | P2 | Stripped for MVP — user at keyboard, re-run manually |
 | Circuit breaker / rate limiter (§4.1) | P2 | Stripped for MVP — simple retry-with-backoff only |
 | LLMClient (§4.1) with provider adaptability | P1 | Required for Clotho function, but can start hardcoded |
 
