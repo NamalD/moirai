@@ -2082,7 +2082,23 @@ The following conventions govern agent interactions with the Moirai project:
 - **Every document change must be committed and pushed individually.** When Hephaestus updates the spec, commit and push. When Daedalus adds a comment response, commit and push. When Argus submits a review, commit and push.
 - **Work off `main` branch** for now. No feature branches — we're small enough that linear history is fine.
 - **Agents run sequentially**, not in parallel. This avoids merge conflicts and ensures each agent works off the latest state.
-- **Descriptive commit messages** — each commit message should reference what changed and why (e.g., "v5: Add template workflows (§7.7)" or "Argus review: testability gaps for loop steps").
+- **Agent git authorship.** Every agent sets their name and the `@namal.dev` email domain before committing:
+  ```
+  export GIT_AUTHOR_NAME="Hephaestus"
+  export GIT_AUTHOR_EMAIL="hephaestus@namal.dev"
+  export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+  export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+  ```
+- **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
+  ```
+  [Phase 1] Implement YAML schema validation in Themis (#3)
+  
+  - PyYAML safe_load with structured error handling
+  - Schema conformance checks per SPEC.md §5
+  - Agent cross-reference validation
+  - All GraphValidator structural checks integrated
+  ```
+- **Board transitions** are manual for MVP. Automated board updates (status transitions + comments on issues) are tracked as a future enhancement — see GitHub Issue #10.
 
 ### File Locations
 

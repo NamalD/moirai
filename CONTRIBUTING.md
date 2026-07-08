@@ -51,8 +51,23 @@ All agents working on this project follow these rules:
 
 1. **Every document change is committed and pushed individually.** Spec update → commit + push. Comment added → commit + push.
 2. **Work off `main` branch.** No feature branches for doc changes.
-3. **Agents run sequentially.** This avoids merge conflicts and ensures each agent works off the latest state.
-4. **Descriptive commit messages.** Each commit references what changed and why (e.g. "v5: Add template workflows (§7.7)").
+3. **Agents run sequentially.** Avoids merge conflicts and ensures each agent works off the latest state.
+4. **Agent git authorship.** Every agent sets their name and the `@namal.dev` email domain before committing:
+   ```bash
+   export GIT_AUTHOR_NAME="Hephaestus"
+   export GIT_AUTHOR_EMAIL="hephaestus@namal.dev"
+   export GIT_COMMITTER_NAME="$GIT_AUTHOR_NAME"
+   export GIT_COMMITTER_EMAIL="$GIT_AUTHOR_EMAIL"
+   ```
+5. **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
+   ```
+   [Phase 1] Implement YAML schema validation in Themis (#3)
+
+   - PyYAML safe_load with structured error handling
+   - Schema conformance checks per SPEC.md §5
+   - Agent cross-reference validation
+   - All GraphValidator structural checks integrated
+   ```
 
 ## File Layout
 
