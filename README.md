@@ -52,3 +52,7 @@ Everything else is deterministic Python:
 ## Development
 
 See [`CONTRIBUTING.md`](CONTRIBUTING.md) for contribution guidelines, version tracking conventions, and the bootstrapping workflow.
+
+## Self-Improvement
+
+Moirai is designed to build itself. See [`SELF_IMPROVEMENT.md`](SELF_IMPROVEMENT.md) for the recursive self-improvement cycle, GitHub Issues backlog, and how features flow from the project board into autonomous implementation workflows.
