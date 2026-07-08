@@ -1121,7 +1121,7 @@ When Lachesis encounters a loop step (identified by the presence of a `LoopDef` 
 ```yaml
 # ~/.moirai/templates/dev-workflow.yaml
 name: "dev-workflow"
-description: "Standard development workflow: implement, review, fix"
+description: "Standard development workflow: implement with Claude Code, review with Themis, loop until approved"
 version: 1
 
 parameters:
@@ -1131,62 +1131,39 @@ parameters:
   - name: prompt
     description: "Task description for the implementation step"
     required: true
-  - name: dev_agent
-    description: "Agent ID for development tasks"
-    default: "hermes-dev"
-  - name: review_agent
-    description: "Agent ID for review tasks"
-    default: "hermes-review"
   - name: max_loop_attempts
     description: "Maximum loop iterations for review-fix cycle"
     default: 5
-  - name: deploy_step
-    description: "Include deploy step after completion"
-    default: false
 
-workflow:
-  id: "{{ .project }}-{{ .prompt | slugify }}"
-  name: "{{ .project }}: {{ .prompt }}"
-  version: 1
+tasks:
+  - id: "implement"
+    type: "agent"
+    agent: "claude-dev"
+    command: "claude --print --project {{ .project }} --prompt \"{{ .prompt }}\""
+    deps: []
+    max_retries: 2
   
-  agents:
-    - id: "{{ .dev_agent }}"
-      name: "{{ .dev_agent }}"
-      command: "hermes --profile {{ .dev_agent }}"
-    - id: "{{ .review_agent }}"
-      name: "{{ .review_agent }}"
-      command: "hermes --profile {{ .review_agent }}"
-  
-  tasks:
-    - id: "implement"
-      type: "agent"
-      agent: "{{ .dev_agent }}"
-      command: "{{ .dev_agent }} implement --project {{ .project }} \"{{ .prompt }}\""
-      deps: []
-      max_retries: 2
-    
-    - id: "review-loop"
-      type: loop
-      max_iterations: {{ .max_loop_attempts }}
-      terminate_on: "APPROVED"
-      deps: ["implement"]
-      steps:
-        - id: "review"
-          agent: "{{ .review_agent }}"
-          command: "{{ .review_agent }} review --project {{ .project }}"
-          deps: []
-        - id: "fix"
-          type: "agent"
-          agent: "{{ .dev_agent }}"
-          command: "{{ .dev_agent }} fix --project {{ .project }} --review-feedback {{ .project }}/review-output.md"
-          deps: ["review"]
+  - id: "review-loop"
+    type: loop
+    max_iterations: {{ .max_loop_attempts }}
+    terminate_on: "APPROVED"
+    deps: ["implement"]
+    steps:
+      - id: "review"
+        agent: "themis-review"
+        command: "hermes --profile themis review --project {{ .project }}"
+        deps: []
+      - id: "fix"
+        type: "agent"
+        agent: "claude-dev"
+        command: "claude --print --project {{ .project }} --prompt \"Address review feedback\""
+        deps: ["review"]
 
     - id: "deploy"
       type: "script"
-      agent: "ci-agent"
+      agent: "script-runner"
       command: "./scripts/deploy.sh {{ .project }}"
       deps: ["review-loop"]
-      {{ if not .deploy_step }}enabled: false{{ end }}
 ```
 
 **Template storage:** Templates are stored as `.yaml` files in:
@@ -1257,16 +1234,29 @@ Agents are registered via a YAML configuration file at a well-known path (`~/.mo
 ```yaml
 # ~/.moirai/agents.yaml
 agents:
-  - id: "etl-agent"
-    name: "ETL Worker"
-    command: "/usr/local/bin/etl-worker"
-    work_dir: "/var/moirai/etl"
-    max_concurrent_tasks: 4
-    
-  - id: "ml-agent"
-    name: "ML Trainer" 
-    command: "/usr/local/bin/ml-train"
+  - id: "claude-dev"
+    name: "Claude Code"
+    description: "Autonomous AI coding agent by Anthropic. Used for implementation tasks."
+    command: "claude --print"
+    work_dir: "{{project}}"
     max_concurrent_tasks: 1
+    tags: [dev, implementation]
+    
+  - id: "themis-review"
+    name: "Themis (Reviewer)"
+    description: "Quality reviewer — validates spec compliance, checks code quality."
+    command: "hermes --profile themis"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 1
+    tags: [review, quality]
+
+  - id: "script-runner"
+    name: "Script Runner"
+    description: "Runs shell scripts (build, deploy, test) without an LLM agent."
+    command: "/bin/bash"
+    work_dir: "{{project}}"
+    max_concurrent_tasks: 3
+    tags: [script, build, deploy]
 ```
 
 The agent registry is loaded at startup in `moirai/agents/registry.py` and validated for:

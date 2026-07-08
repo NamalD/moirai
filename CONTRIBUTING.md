@@ -6,8 +6,17 @@ Before you can build or run Moirai, you'll need:
 
 - **Python 3.11+** — the runtime
 - **[uv](https://docs.astral.sh/uv/)** — Python package manager and project tool (v0.4+)
+- **[Claude Code](https://docs.anthropic.com/en/docs/claude-code/overview)** — autonomous AI coding agent used for implementation tasks (v2.1+)
 
-`uv` handles dependency resolution, virtual environment management, and task running. It replaces both `pip`/`pip-tools` and `poetry`. Install it:
+`uv` handles dependency resolution, virtual environment management, and task running. `Claude Code` (`claude --print`) is used by Moirai's dev workflow template for implementation tasks.
+
+Install Claude Code:
+```bash
+npm install -g @anthropic-ai/claude-code
+# Or via the installer: curl -sS https://raw.githubusercontent.com/anthropics/claude-code/main/install.sh | sh
+```
+
+`uv` handles dependency resolution, virtual environment management, and task running. Install it:
 
 ```bash
 curl -LsSf https://astral.sh/uv/install.sh | sh
