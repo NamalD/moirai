@@ -1,0 +1,1424 @@
+---
+title: "Moirai — Specification Document"
+type: spec
+version: 2
+tags: [moirai, architecture, project, spec]
+created: 2026-07-08
+updated: 2026-07-08
+status: draft
+repo: NamalD/moirai
+language: Python (stdlib only, zero pip dependencies)
+---
+
+# Moirai — Deterministic Agent Task Graph Scheduler
+
+## 1. Overview
+
+Moirai is a deterministic **agent task graph scheduler** built in pure Python (standard library only, zero pip dependencies). It orchestrates multi-step agent workflows by accepting a high-level user prompt and driving it through a pipeline of components — from natural-language intent to a validated state machine to deterministic task execution.
+
+The system is named after the **Moirai** (the three Fates of Greek mythology) and related figures, reflecting each component's role in weaving, measuring, and cutting the threads of a workflow.
+
+At a high level, Moirai:
+
+1. Accepts a user's natural-language prompt describing a desired workflow.
+2. Uses an LLM-powered component (**Clotho**) to generate a YAML workflow artifact.
+3. Validates the YAML via another LLM component (**Themis**) which performs semantic validation, then passes to a deterministic **GraphValidator** for structural checks (acyclicity, well-formed transitions).
+4. Executes the state machine deterministically via a scheduler (**Lachesis**).
+5. Handles mid-flight changes, task failures, and timeouts through dedicated consolidation (**Penelope**) and cleanup (**Atropos**) components.
+
+**Key design principles:**
+- **Deterministic execution** — the scheduling, task graph traversal, graph validation, consolidation, and cleanup are purely deterministic, with non-determinism isolated to the LLM components (Clotho, Themis).
+- **Zero external dependencies** — the entire runtime uses only Python's standard library. YAML is emitted/consumed as raw strings (no YAML parser library needed).
+- **Error recovery via retry loops** — validation failures, hanging tasks, and problematic YAML changes trigger structured retry loops with escalation to human intervention when limits are exceeded.
+- **Testability by design** — all component boundaries are defined as Python Protocol interfaces, enabling test doubles (fakes/mocks) for isolated unit testing.
+
+---
+
+## 2. Module / Package Structure
+
+```
+moirai/
+├── __init__.py            # Pipeline wiring, entry point
+├── __main__.py            # CLI entry point: python -m moirai
+├── config.py              # Config dataclass, env/file loading, validation
+├── types.py               # All shared data structures (dataclasses, TypedDicts)
+├── protocols.py           # All interface protocols (LLMClient, PersistenceBackend, etc.)
+├── clotho.py              # Clotho — LLM-powered YAML generation
+├── themis.py              # Themis — LLM-powered semantic validation
+├── graph_validator.py     # Deterministic DAG acyclicity & structural checks
+├── lachesis.py            # Lachesis — deterministic scheduler
+├── penelope.py            # Penelope — deterministic consolidation
+├── atropos.py             # Atropos — cleanup / process termination
+├── persistence/
+│   ├── __init__.py        # PersistenceBackend protocol + factory
+│   ├── file_backend.py    # File-based backend (atomic rename)
+│   └── memory_backend.py  # In-memory backend (testing, single-run)
+├── agents/
+│   ├── __init__.py        # Agent registry loading
+│   └── registry.py        # AgentDef dataclass, config file loading
+├── human_intervention.py  # Human decision polling, timeout, fallback
+├── logging_utils.py       # Structured JSON logging
+├── metrics.py             # Internal counters/gauges
+└── audit.py               # Append-only audit log
+```
+
+---
+
+## 3. Core Data Structures
+
+All shared types live in `types.py` as Python dataclasses. These are the contracts between every component.
+
+```python
+from dataclasses import dataclass, field
+from typing import Optional, Literal
+from enum import Enum, auto
+
+
+# ─── Enums ──────────────────────────────────────────────────────────
+
+class TaskStatus(Enum):
+    PENDING    = auto()
+    READY      = auto()
+    RUNNING    = auto()
+    COMPLETED  = auto()
+    FAILED     = auto()
+    CANCELLED  = auto()
+    SKIPPED    = auto()
+
+class HumanDecision(Enum):
+    RETRY   = auto()   # Re-attempt the failed/hanging task
+    SKIP    = auto()   # Mark task as skipped, continue workflow
+    ABORT   = auto()   # Abort the entire workflow
+    RESTART = auto()   # Restart the workflow from scratch
+
+class FailureReason(Enum):
+    TIMEOUT_EXCEEDED = auto()
+    CRASH_LIMIT_EXCEEDED = auto()
+    CONSOLIDATION_FAILURE = auto()
+    CLOTHO_TIMEOUT = auto()
+    USER_ABORT = auto()
+
+class CleanupOutcome(Enum):
+    KILLED          = auto()   # SIGTERM succeeded
+    FORCE_KILLED    = auto()   # SIGTERM failed, SIGKILL succeeded
+    ALREADY_DEAD    = auto()   # Process was already gone
+    FAILED          = auto()   # Could not terminate (permission, zombie)
+    SKIPPED         = auto()   # No process to clean up
+
+class PersistenceBackendType(Enum):
+    FILE   = auto()
+    MEMORY = auto()
+    SQLITE = auto()
+
+
+# ─── Core Data Types ────────────────────────────────────────────────
+
+@dataclass
+class AgentDef:
+    """Definition of an agent that can execute tasks."""
+    id: str                              # Unique agent identifier
+    name: str                            # Human-readable name
+    command: str                         # Path to executable or command template
+    env_vars: dict[str, str] = field(default_factory=dict)
+    work_dir: Optional[str] = None
+    max_concurrent_tasks: int = 1
+    tags: list[str] = field(default_factory=list)
+
+@dataclass
+class TaskDef:
+    """A task definition within a workflow YAML artifact."""
+    id: str                              # Stable task identifier (across YAML versions)
+    agent: str                           # References AgentDef.id
+    command: str                         # Shell command to execute
+    deps: list[str] = field(default_factory=list)  # Task IDs this task depends on
+    timeout: int = 3600                  # Seconds before deemed hanging
+    max_retries: int = 3                 # Times to auto-retry on crash
+    env: dict[str, str] = field(default_factory=dict)
+    inputs: dict[str, str] = field(default_factory=dict)
+    outputs: list[str] = field(default_factory=list)
+
+@dataclass
+class ValidationError:
+    """Structured error from validation (Themis or GraphValidator)."""
+    field: str                           # Dot-separated field path, e.g. "tasks.build.command"
+    message: str                         # Human-readable explanation
+    severity: Literal["error", "warning"] = "error"
+    yaml_line: Optional[int] = None      # Line number in the original YAML (if available)
+    error_code: str = "UNKNOWN"          # Machine-readable error code
+    task_id: Optional[str] = None        # Which task the error relates to
+
+@dataclass
+class StateMachine:
+    """Formal representation of a workflow as a DAG of tasks.
+
+    Themis produces this; Lachesis executes it; Penelope diffs it.
+    """
+    workflow_id: str                     # Unique workflow identifier
+    version: int                         # Monotonically increasing per workflow
+    tasks: dict[str, TaskDef]            # task_id → TaskDef (node map)
+    dependencies: dict[str, list[str]]   # task_id → list of dependency task_ids
+    entry_points: list[str]              # Tasks with no dependencies (zero in-degree)
+    metadata: dict[str, str] = field(default_factory=dict)
+
+@dataclass
+class TaskState:
+    """Current execution state of a single task."""
+    task_id: str
+    status: TaskStatus = TaskStatus.PENDING
+    attempts: int = 0                    # Number of times this task has been started
+    started_at: Optional[float] = None   # Unix timestamp
+    completed_at: Optional[float] = None
+    exit_code: Optional[int] = None
+    stdout_path: Optional[str] = None
+    stderr_path: Optional[str] = None
+    failure_reason: Optional[FailureReason] = None
+    error_message: Optional[str] = None
+
+@dataclass
+class ExecutionState:
+    """Snapshot of all task states in a workflow at a point in time."""
+    workflow_id: str
+    tasks: dict[str, TaskState]          # task_id → TaskState
+    current_sm_version: int
+
+@dataclass
+class ConsolidationPlan:
+    """Result of comparing old and new state machines during mid-flight change."""
+    new_tasks: list[str]                 # Task IDs added in new SM
+    removed_tasks: list[str]             # Task IDs absent from new SM
+    unchanged_tasks: list[str]           # Task IDs with identical definition
+    modified_tasks: dict[str, str]       # task_id → "removed+added" reason
+    state_transfers: dict[str, TaskStatus]  # task_id → target status after consolidation
+    can_consolidate: bool
+    errors: list[ConsolidationError] = field(default_factory=list)
+
+@dataclass
+class ConsolidationError:
+    reason: str
+    task_id: Optional[str] = None
+    details: str = ""
+
+@dataclass
+class TaskEvent:
+    """Event emitted when a task transitions between states."""
+    task_id: str
+    from_status: TaskStatus
+    to_status: TaskStatus
+    timestamp: float
+    details: Optional[str] = None
+
+@dataclass
+class ExecutionLog:
+    """Full log of a workflow execution."""
+    workflow_id: str
+    start_time: float
+    end_time: Optional[float] = None
+    tasks: dict[str, TaskState] = field(default_factory=dict)
+    events: list[TaskEvent] = field(default_factory=list)
+    outcome: Optional[str] = None         # "success", "failed", "aborted", "cancelled"
+
+@dataclass
+class ProcessInfo:
+    """Information about a task's OS process."""
+    pid: int
+    pgid: int                            # Process group ID (for killpg cleanup)
+    start_time: float
+    command: str
+    stdout_path: str
+    stderr_path: str
+
+@dataclass
+class CleanupConfig:
+    """Configuration for Atropos cleanup behavior."""
+    sigterm_grace_seconds: int = 10
+    kill_retry_count: int = 3            # Retries on failed SIGKILL
+    kill_retry_delay_seconds: float = 1.0
+    log_retention_days: int = 30
+
+@dataclass
+class CleanupResult:
+    outcome: CleanupOutcome
+    pid: int
+    log_archive_path: Optional[str] = None
+    details: str = ""
+
+@dataclass
+class LogArchive:
+    """Reference to captured logs from a failed/hanging task."""
+    workflow_id: str
+    task_id: str
+    stdout_path: str
+    stderr_path: str
+    archive_path: str                    # Where logs were collected for investigation
+    retained_until: Optional[str] = None  # ISO date of retention expiry
+
+@dataclass
+class AuditEntry:
+    """Single entry in the append-only audit log."""
+    timestamp: float
+    event_type: str                      # e.g. "task_completed", "human_escalation", "clotho_timeout"
+    workflow_id: str
+    task_id: Optional[str] = None
+    details: dict = field(default_factory=dict)
+```
+
+---
+
+## 4. Protocol Interfaces
+
+All protocol interfaces live in `protocols.py`. These enable test doubles (fakes) for isolated unit testing.
+
+### 4.1 LLMClient Protocol
+
+```python
+from typing import Protocol
+
+class LLMClient(Protocol):
+    """Interface for LLM calls used by Clotho and Themis.
+
+    Implementations may wrap OpenAI, Anthropic, local models, or be a
+    FakeLLMClient for testing.
+    """
+    def complete(
+        self,
+        prompt: str,
+        system_prompt: str,
+        max_tokens: int = 4096,
+        temperature: float = 0.7,
+        timeout_seconds: int = 120,
+    ) -> str:
+        """Send a prompt to the LLM and return the text response.
+
+        Raises:
+            TimeoutError: If the LLM does not respond within timeout_seconds.
+            ConnectionError: If the LLM endpoint is unreachable.
+            RateLimitError: If the API rate limit is exceeded.
+        """
+        ...
+
+
+class LLMRateLimiter(Protocol):
+    """Rate limiter for LLM calls to prevent exceeding API quotas."""
+    def acquire(self) -> None:
+        """Block until a request slot is available."""
+        ...
+    
+    def release(self) -> None:
+        """Release a request slot."""
+        ...
+
+
+class CircuitBreaker(Protocol):
+    """Circuit breaker for LLM API calls — prevents hammering a failing endpoint."""
+    def call(self, fn, *args, **kwargs):
+        """Execute fn if circuit is closed; raise CircuitOpenError if open."""
+        ...
+```
+
+### 4.2 PersistenceBackend Protocol
+
+```python
+class PersistenceBackend(Protocol):
+    """Storage interface for tracking task states.
+
+    Must provide atomic read/write operations. The file backend uses
+    atomic rename (os.replace) on POSIX-compliant local filesystems.
+    NFS v3 and FAT32/exFAT do NOT guarantee atomic rename — operators
+    should use SQLite backend or a POSIX-local filesystem.
+    """
+
+    def get_task(self, workflow_id: str, task_id: str) -> Optional[TaskState]: ...
+    def set_task(self, workflow_id: str, task_id: str, state: TaskState) -> None: ...
+    def list_tasks(self, workflow_id: str) -> list[TaskState]: ...
+    
+    def get_execution_state(self, workflow_id: str) -> Optional[ExecutionState]: ...
+    def set_execution_state(self, state: ExecutionState) -> None: ...
+    
+    def atomic_transaction(self) -> ContextManager:
+        """Context manager providing atomic all-or-nothing writes.
+        
+        If an exception occurs inside the context, all writes are discarded.
+        On success exit, all writes are committed atomically.
+        """
+        ...
+
+    def health_check(self) -> bool:
+        """Verify the backend is operational (can read/write)."""
+        ...
+
+    def get_schema_version(self) -> int: ...
+    def set_schema_version(self, version: int) -> None: ...
+```
+
+### 4.3 ProcessManager Protocol
+
+```python
+class ProcessManager(Protocol):
+    """Abstraction over OS process management for testability."""
+
+    def spawn(self, task_def: TaskDef, agent_def: AgentDef,
+              work_dir: str, log_dir: str) -> ProcessInfo:
+        """Spawn a task as a child process with process-group isolation.
+        
+        The child is placed in a new process group (os.setpgid) so that
+        Atropos can kill the entire process tree via os.killpg.
+        """
+        ...
+
+    def poll(self, process: ProcessInfo) -> Optional[int]:
+        """Check if process has exited. Returns exit code or None."""
+        ...
+
+    def wait(self, process: ProcessInfo, timeout: float) -> int:
+        """Wait for process to exit. Returns exit code. Raises TimeoutError."""
+        ...
+
+    def signal(self, process: ProcessInfo, sig: int) -> None:
+        """Send a signal to the process group (os.killpg)."""
+        ...
+
+    def read_output(self, process: ProcessInfo) -> tuple[str, str]:
+        """Read captured stdout/stderr from log files."""
+        ...
+```
+
+### 4.4 HumanNotifier Protocol
+
+```python
+class HumanNotifier(Protocol):
+    """Interface for requesting and polling human decisions."""
+
+    def request_intervention(
+        self,
+        workflow_id: str,
+        task_id: Optional[str],
+        reason: str,
+        logs: Optional[str] = None,
+    ) -> str:
+        """Raise a human intervention request.
+        
+        Returns a request ID that can be used to poll for the decision.
+        The notification mechanism is implementation-defined (file signal,
+        stdout message, HTTP callback, email).
+        """
+        ...
+
+    def poll_decision(
+        self,
+        request_id: str,
+        timeout_seconds: float = 86400.0,  # Default 24h
+    ) -> Optional[HumanDecision]:
+        """Poll for a human decision.
+        
+        Returns None if no decision has been made yet.
+        Raises TimeoutError if the timeout expires without a decision
+        (the default fallback is HumanDecision.ABORT).
+        """
+        ...
+
+    def cancel_request(self, request_id: str) -> None: ...
+```
+
+### 4.5 Clock / TimeProvider Protocol
+
+```python
+class TimeProvider(Protocol):
+    """Abstract time source for testing time-dependent behavior."""
+
+    def now(self) -> float:
+        """Current time in Unix seconds."""
+        ...
+
+    def sleep(self, seconds: float) -> None:
+        """Block for the given duration (or advance fake time in tests)."""
+        ...
+```
+
+### 4.6 TaskInvestigator Protocol
+
+```python
+class TaskInvestigator(Protocol):
+    """Bounded context for Clotho to investigate a hanging task.
+    
+    Clotho does NOT have unbounded system access — it can only use
+    the methods below to gather information.
+    """
+    def read_logs(self, task_id: str, max_lines: int = 200) -> str: ...
+    def get_task_state(self, task_id: str) -> Optional[TaskState]: ...
+    def list_workflow_tasks(self) -> list[TaskState]: ...
+    def get_workflow_context(self) -> dict: ...
+```
+
+---
+
+## 5. YAML Workflow Schema
+
+The YAML artifact is a string emitted by Clotho and consumed by Themis. Since Moirai uses stdlib only (no PyYAML), YAML is:
+- **Emitted** as raw strings by Clotho (using string formatting/templates)
+- **Parsed** by a minimal handwritten YAML parser in `moirai/yaml_util.py` supporting the subset below
+- **Validated semantically** by Themis (LLM) after structural parsing
+
+### Schema
+
+```yaml
+# Minimal example: data pipeline
+workflow:
+  id: "data-pipeline-001"
+  name: "Data Processing Pipeline"
+  version: 1
+  
+  agents:
+    - id: "etl-agent"
+      name: "ETL Worker"
+      command: "/usr/local/bin/etl-worker"
+    
+    - id: "ml-agent"
+      name: "ML Trainer"
+      command: "/usr/local/bin/ml-train"
+  
+  tasks:
+    - id: "extract"
+      agent: "etl-agent"
+      command: "./scripts/extract.sh --source {{ .inputs.source }}"
+      deps: []
+      timeout: 300
+      max_retries: 2
+      inputs:
+        source: "s3://data/raw"
+    
+    - id: "transform"
+      agent: "etl-agent"
+      command: "./scripts/transform.sh"
+      deps: ["extract"]
+      timeout: 600
+      max_retries: 3
+    
+    - id: "load"
+      agent: "etl-agent"
+      command: "./scripts/load.sh"
+      deps: ["transform"]
+      timeout: 300
+      max_retries: 2
+    
+    - id: "train"
+      agent: "ml-agent"
+      command: "./scripts/train.py --data-dir {{ .inputs.data_dir }}"
+      deps: ["load"]
+      timeout: 3600
+      max_retries: 1
+      inputs:
+        data_dir: "/tmp/transformed"
+```
+
+### Schema Rules
+
+| Field | Parent | Required | Type | Description |
+|-------|--------|----------|------|-------------|
+| `workflow` | root | yes | dict | Root element |
+| `workflow.id` | workflow | yes | string | Unique workflow identifier |
+| `workflow.name` | workflow | yes | string | Human-readable name |
+| `workflow.version` | workflow | yes | int | Monotonically increasing |
+| `workflow.agents[]` | workflow | yes | list | Agent definitions |
+| `workflow.agents[].id` | agent | yes | string | Unique agent ID (referenced by tasks) |
+| `workflow.agents[].name` | agent | yes | string | Human-readable agent name |
+| `workflow.agents[].command` | agent | yes | string | Executable path or command template |
+| `workflow.tasks[]` | workflow | yes | list | Task definitions |
+| `workflow.tasks[].id` | task | yes | string | Stable task identifier |
+| `workflow.tasks[].agent` | task | yes | string | References an agent ID |
+| `workflow.tasks[].command` | task | yes | string | Shell command to execute |
+| `workflow.tasks[].deps` | task | yes | list of strings | Task IDs this task depends on |
+| `workflow.tasks[].timeout` | task | no (default: 3600) | int | Max seconds before deemed hanging |
+| `workflow.tasks[].max_retries` | task | no (default: 3) | int | Auto-retry count on crash |
+| `workflow.tasks[].inputs` | task | no | dict | Key-value input parameters |
+
+---
+
+## 6. GraphValidator — Deterministic Structural Validation
+
+**New component** (extracted from Themis). While Themis handles semantic validation via LLM, **GraphValidator** handles all deterministic structural checks.
+
+**Role:** Validates that a parsed workflow YAML forms a valid DAG with well-formed transitions. Runs *after* Themis's semantic validation and *before* Lachesis accepts the StateMachine.
+
+**Nature:** Fully deterministic. Simple graph algorithms — no LLM involvement.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `tasks` | `dict[str, TaskDef]` | Parsed task definitions |
+| `dependencies` | `dict[str, list[str]]` | Dependency adjacency lists |
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `state_machine` | `Optional[StateMachine]` | Validated state machine (if all checks pass) |
+| `errors` | `list[ValidationError]` | Structural errors found |
+| `is_valid` | `bool` | Whether the graph passed all checks |
+
+**Validation checks:**
+1. **Acyclicity** — DFS-based cycle detection (back-edge check). Guarantees the dependency graph is a DAG.
+2. **All task references valid** — every `deps` entry references an existing task ID.
+3. **Agent references valid** — every task's `agent` field references an existing agent ID.
+4. **No orphan tasks** — every task is reachable from at least one entry point (transitive closure).
+5. **Single root** — there is at least one task with zero dependencies (entry point).
+6. **Topological ordering** — tasks can be topologically sorted (produce execution order).
+7. **Well-formed transitions** — no self-loops, no duplicate dependency entries.
+
+**Assumptions:**
+- The YAML has already been structurally parsed (basic YAML → dict conversion) before reaching GraphValidator.
+- Themis has already verified semantic correctness (agent names match real agents, commands are plausible).
+- GraphValidator outputs a `StateMachine` with `entry_points`, `dependencies`, and a topologically sorted task order.
+
+---
+
+## 7. Updated Component Breakdown
+
+### 7.1 Clotho — YAML Generation (LLM, Non-deterministic)
+
+**Role:** Entry point into the system. Clotho takes a user's natural-language prompt and generates a valid YAML workflow artifact.
+
+**Nature:** LLM-powered, non-deterministic. The same prompt may produce different YAML outputs across invocations.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `user_prompt` | `str` | Natural-language description of the desired workflow |
+| `previous_yaml` (optional) | `str` | Previously generated YAML from a prior Clotho attempt (provided during retry loops) |
+| `validation_errors` (optional) | `list[ValidationError]` | Structured errors from Themis or GraphValidator when re-attempting after a validation failure |
+| `hanging_task_info` (optional) | `HangingTaskInfo` | Task ID, failure reason, and a bounded `TaskInvestigator` context for investigation |
+| `max_retries` | `int` | Maximum number of consecutive Clotho → Themis cycles before escalation |
+| `investigator` (optional) | `TaskInvestigator` | Bounded investigation context for mid-flight hang recovery |
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `yaml_artifact` | `str` | A YAML string describing tasks, their properties, dependencies, and assigned agents |
+| `escalation_needed` | `bool` | Flag indicating Clotho needs more information from the user (human intervention) |
+| `escalation_message` | `str` | Free-text message to the user explaining what additional information is required |
+
+**Assumptions:**
+- Clotho has access to a configured `LLMClient` (via dependency injection — not hardcoded).
+- Clotho understands the YAML schema for workflow artifacts (defined in §5).
+- Clotho can escalate to the user when the prompt is ambiguous or incomplete.
+- The YAML output is syntactically valid YAML, but *not* guaranteed to be semantically valid — that is Themis's job.
+- Clotho has a configurable timeout; if exceeded, Clotho is killed and the user is notified.
+- Clotho uses the `LLMClient` protocol with exponential backoff on transient errors.
+
+**Behavior in failure loops:**
+- Given previous YAML + validation errors, Clotho should attempt to fix the specific issues rather than regenerate from scratch.
+- Given `hanging_task_info` + bounded `TaskInvestigator`, Clotho may read logs and inspect task state but has no unbounded system access.
+- Clotho should attempt to produce a *different* YAML than the previous attempt (avoiding no-op retries). Themis/GraphValidator can detect identical re-submissions and reject them.
+- Retries use exponential backoff (base delay 1s, multiplier 2x, max 30s) with jitter.
+
+**HangingTaskInfo structure:**
+```python
+@dataclass
+class HangingTaskInfo:
+    task_id: str
+    failure_reason: FailureReason
+    previous_yaml: str
+    current_execution_state: ExecutionState
+```
+
+---
+
+### 7.2 Themis — Semantic Validator (LLM, Non-deterministic)
+
+**Role:** Themis validates the YAML workflow artifact produced by Clotho, checking that tasks have semantically correct properties, agents referenced match known agents, and the workflow makes logical sense. On success, it passes the parsed data to GraphValidator for structural checks. On failure, it returns structured errors to Clotho.
+
+**Nature:** LLM-powered, non-deterministic.
+
+> **Note:** The existing Hermes profile named `themis` will need renaming to avoid a naming conflict with this component.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `yaml_artifact` | `str` | The YAML workflow string to validate |
+| `known_agents` | `list[AgentDef]` | List of agents from the agent registry, for cross-referencing |
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `parsed_workflow` | `ParsedWorkflow` | Structurally parsed workflow data (dict form) |
+| `validation_errors` | `list[ValidationError]` | Structured error list describing semantic issues |
+| `is_valid` | `bool` | Whether the YAML passed semantic validation |
+
+**Themis handles (semantic validation):**
+- Agent names in `known_agents` are semantically meaningful and correctly referenced.
+- Task commands are plausible and well-formed for their assigned agent.
+- Input parameter references (e.g., `{{ .inputs.xxx }}`) reference valid input keys.
+- The workflow description matches the user's intent.
+- No ambiguous or contradictory task definitions.
+
+**Themis does NOT handle (deterministic checks delegated to GraphValidator):**
+- DAG acyclicity (cycle detection) — see §6 GraphValidator.
+- Dependency graph structure / topological ordering.
+- Missing task ID references (handled structurally).
+- State machine well-formedness (handled structurally).
+
+**Assumptions:**
+- Themis has access to a configured `LLMClient` (same or different from Clotho's).
+- The YAML schema is documented (§5) and stable across versions.
+- Themis outputs parsed data that GraphValidator can consume.
+- Validation errors use the `ValidationError` structure defined in §3, which Clotho can parse and act upon.
+- Themis uses the `LLMClient` protocol with exponential backoff on transient errors.
+
+---
+
+### 7.3 GraphValidator — Deterministic Structural Validator
+
+(See §6 above for full definition.)
+
+**Pipeline position:** User Prompt → Clotho → YAML → Themis (semantic) → GraphValidator (structural) → StateMachine → Lachesis
+
+---
+
+### 7.4 Lachesis — Deterministic Scheduler (Deterministic)
+
+**Role:** Lachesis is the core scheduling engine. It takes a validated state machine from GraphValidator and executes the workflow deterministically. It polls tasks, updates progress on the persistence layer, and kicks off the next task when all its dependencies have been met.
+
+**Nature:** Fully deterministic. No LLM involvement. Pure logic.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `state_machine` | `StateMachine` | The validated state machine from GraphValidator |
+| `persistence` | `PersistenceBackend` | Storage interface for tracking task states |
+| `process_manager` | `ProcessManager` | Interface for spawning and managing task processes |
+| `human_notifier` | `HumanNotifier` | Interface for human escalation |
+| `time_provider` | `TimeProvider` | Abstract time source |
+| `config` | `SchedulerConfig` | Scheduler configuration |
+
+**SchedulerConfig:**
+```python
+@dataclass
+class SchedulerConfig:
+    max_concurrent_tasks: int = 4       # Max tasks running simultaneously
+    poll_interval_seconds: float = 1.0  # How often to check for ready tasks
+    hang_check_interval_seconds: float = 5.0  # How often to check for hanging tasks
+    crash_recovery_enabled: bool = True
+    graceful_shutdown_timeout: float = 30.0
+```
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `task_status_updates` | `list[TaskEvent]` | Events emitted when tasks transition between states |
+| `execution_log` | `ExecutionLog` | Full log of all task executions, durations, and outcomes |
+
+**Responsibilities:**
+- Maintain a queue of ready tasks (all deps satisfied, not yet started).
+- Enforce `max_concurrent_tasks` — do not exceed the configured parallelism limit.
+- Use `ProcessManager.spawn()` to dispatch tasks as subprocesses with process-group isolation.
+- Use `ProcessManager.poll()` for non-blocking completion checks (polling model — no blocking waitpid).
+- Track crash counts in persistence per task.
+- Run a periodic hang check using `TimeProvider` to detect running tasks that exceed their timeout.
+- Detect hanging tasks (crash count exceeds max_retries, or runtime exceeds timeout).
+- Trigger Atropos when a task is determined to be hanging.
+- Detect mid-flight YAML changes by watching for a new state machine file/signal.
+- When a new state machine arrives mid-flight: pause execution atomically, capture `ExecutionState`, call Penelope, apply consolidation plan, resume.
+- Persist all state changes durably using `PersistenceBackend.atomic_transaction()`.
+- Install a SIGTERM handler for graceful shutdown: stop accepting new tasks, wait for running tasks up to `graceful_shutdown_timeout`, checkpoint execution state, exit cleanly.
+- Support workflow cancellation (user-initiated abort via signal or CLI command): mark all pending/ready tasks as CANCELLED, kill running tasks via Atropos, generate final execution log.
+
+**Polling model:** Lachesis uses a non-blocking event loop:
+```
+loop:
+  for each running task:
+    exit_code = process_manager.poll(process_info)
+    if exit_code is not None:
+      handle_completion(task_id, exit_code)
+  
+  # Check for newly ready tasks
+  ready = find_ready_tasks(execution_state, state_machine)
+  while ready and running_count < max_concurrent_tasks:
+    task = ready.pop(0)
+    dispatch_task(task)
+  
+  # Check for hanging tasks
+  check_for_hangs(execution_state, time_provider.now())
+  
+  time_provider.sleep(poll_interval)
+```
+
+**Hang detection mechanism:**
+- Crash count is tracked in `TaskState.attempts` and persisted.
+- Each time a task crashes (non-zero exit code), attempts is incremented. If `attempts > task_def.max_retries`, the task is marked hanging and Atropos is invoked.
+- Runtime is tracked by comparing `TaskState.started_at` against `TimeProvider.now()`. If `now - started_at > task_def.timeout`, the task is marked hanging.
+- Hang checks run at `hang_check_interval_seconds` intervals (configurable, default 5s).
+
+**Crash recovery:** If Lachesis itself crashes mid-workflow, on restart:
+1. Load `ExecutionState` from persistence.
+2. Tasks in `RUNNING` state are treated with caution — Atropos is invoked to clean them up (they may still be alive or already dead).
+3. Tasks in `PENDING`/`READY` state are preserved as-is.
+4. The state machine is reloaded and execution resumes from the current state.
+5. A recovery audit entry is created.
+
+**Assumptions:**
+- The persistence layer provides atomic read/write operations for task state.
+- Tasks report their status back through process exit code (captured by ProcessManager).
+- Lachesis runs as a long-lived process (or is restarted with state recovery as described above).
+- The state machine's DAG is traversed based on topological order (entry points first, then tasks whose dependencies are satisfied).
+
+---
+
+### 7.5 Penelope — Consolidation (Deterministic)
+
+**Role:** When a YAML change occurs mid-flight (e.g., Clotho generates a new workflow to handle a hanging task), Penelope compares the old and new state machines to determine what changed and whether the new machine can be consolidated with the current execution state.
+
+**Nature:** Deterministic. Pure logic — no LLM involvement.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `old_state_machine` | `StateMachine` | The previously validated state machine currently being executed |
+| `new_state_machine` | `StateMachine` | The proposed replacement state machine from GraphValidator |
+| `current_execution_state` | `ExecutionState` | Snapshot of what tasks have been completed, are running, or are pending |
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `consolidation_plan` | `ConsolidationPlan` | Structured diff: new tasks, removed tasks, unchanged tasks, modified tasks, and state transfers |
+
+**Task identity model:** Task identity is determined by `task_id` (stable across YAML versions).
+- **Same task_id + same properties** → Unchanged task. Preserve current state.
+- **Same task_id + different properties** → Modified task. See compatibility rules below.
+- **task_id in new but not old** → New task. Added as PENDING.
+- **task_id in old but not new** → Removed task. See rules below.
+
+**Consolidation rules:**
+
+| Scenario | Rule |
+|----------|------|
+| **New task** (in new SM only) | Added to persistence as PENDING |
+| **Removed task — not yet started** | Safe to remove |
+| **Removed task — completed** | **Invalid** — consolidation fails (cannot erase history) |
+| **Removed task — running or hanging** | Mark for cancellation via Atropos, then remove from new SM |
+| **Unchanged task** | Preserve current state (PENDING → PENDING, RUNNING → RUNNING, etc.) |
+| **Modified task — same agent, same command shape** | Compatible — state transfers as: PENDING → PENDING, READY → READY, RUNNING → reset to PENDING (too risky to keep running with new params), COMPLETED → stay COMPLETED if the change is backward-compatible (e.g., new timeout), otherwise fail |
+| **Modified task — different agent or different command** | Incompatible — treated as removed (old) + new (new). If the old task was RUNNING, Atropos cancels it first. If COMPLETED, consolidation fails |
+
+**Atomicity / Rollback:** Penelope operates as a two-phase process:
+1. **Validation phase** — Compute the entire `ConsolidationPlan` in memory. Check all rules. If any rule fails (e.g., completed task removed), return `can_consolidate=False` with errors. No persistence changes are made during this phase.
+2. **Application phase** — Only enters if `can_consolidate=True`. All persistence changes are applied within a single `PersistenceBackend.atomic_transaction()`. If anything fails mid-application, the transaction is rolled back and the system remains in the pre-consolidation state.
+
+**Assumptions:**
+- Task identity is determined by a stable `task_id` field that persists across YAML versions.
+- The state machine includes version metadata.
+- The execution state is captured atomically before Penelope runs (Lachesis pauses execution, takes a snapshot, then calls Penelope).
+- Penelope is a pure function with no side effects.
+
+---
+
+### 7.6 Atropos — Cleanup (Deterministic)
+
+**Role:** When a task is determined to be hanging (crashed N times, exceeded timeout), Atropos is invoked to cleanly kill the entire process tree, record logs for investigation, and request human intervention.
+
+**Nature:** Deterministic. Process management.
+
+**Inputs:**
+| Input | Type | Description |
+|-------|------|-------------|
+| `task_id` | `str` | The identifier of the hanging task |
+| `task_process_info` | `ProcessInfo` | Process handle, PID, PGID, start time, stdout/stderr paths |
+| `failure_reason` | `FailureReason` | Why the task was deemed hanging |
+| `config` | `CleanupConfig` | Timeout for kill signals, log retention policy, retry settings |
+| `process_manager` | `ProcessManager` | Interface for process signaling and log capture |
+| `human_notifier` | `HumanNotifier` | Interface for escalating to a human |
+
+**Outputs:**
+| Output | Type | Description |
+|--------|------|-------------|
+| `cleanup_result` | `CleanupResult` | Outcome of cleanup (killed, force-killed, already dead, failed) |
+| `log_archive` | `LogArchive` | Path to collected logs for investigation |
+| `human_intervention_requested` | `bool` | Whether human action is required after Atropos runs |
+
+**Behavior:**
+1. Send `SIGTERM` to the **process group** (using `os.killpg(pgid, signal.SIGTERM)`), not just the parent PID — this kills child/grandchild processes too.
+2. Wait for configurable grace period (`sigterm_grace_seconds`).
+3. If process group still alive, send `SIGKILL` to the process group.
+4. If `SIGKILL` fails (permission denied, zombie), retry up to `kill_retry_count` times with `kill_retry_delay_seconds` delay between attempts.
+5. If all retries fail, log a warning and set outcome to FAILED.
+6. Capture stdout/stderr from the task's log files (paths from `ProcessInfo`).
+7. Log and archive the output for investigation (archive path is a timestamped subdirectory under `{log_dir}/{workflow_id}/{task_id}/`).
+8. Mark the task as `failed` in persistence with failure reason.
+9. Record a detailed failure report in the audit log.
+10. Raise a human intervention request via `HumanNotifier.request_intervention()`.
+
+**Assumptions:**
+- The task is running as a child process in a process group that the scheduler can signal.
+- Tasks are spawned with `os.setpgid()` to place them in their own process group.
+- Logs are written to a known location (convention: `{log_dir}/{workflow_id}/{task_id}/{timestamp}.stdout` and `.stderr`).
+- Human intervention means a person picks up the failure report and decides how to proceed (retry, skip, abort) — polled via `HumanNotifier.poll_decision()`.
+- Atropos does NOT attempt to fix the task — it only cleans up and escalates.
+- Atropos has a retry loop for cleanup failures (up to `kill_retry_count` retries on failed kill), after which it logs a warning and still escalates.
+
+---
+
+## 8. Agent Registry
+
+Agents are registered via a YAML configuration file at a well-known path (`~/.moirai/agents.yaml` or `MOIRAI_AGENTS_CONFIG` env var).
+
+```yaml
+# ~/.moirai/agents.yaml
+agents:
+  - id: "etl-agent"
+    name: "ETL Worker"
+    command: "/usr/local/bin/etl-worker"
+    work_dir: "/var/moirai/etl"
+    max_concurrent_tasks: 4
+    
+  - id: "ml-agent"
+    name: "ML Trainer" 
+    command: "/usr/local/bin/ml-train"
+    max_concurrent_tasks: 1
+```
+
+The agent registry is loaded at startup in `moirai/agents/registry.py` and validated for:
+- Unique agent IDs
+- Non-empty command paths
+- Positive `max_concurrent_tasks`
+
+The registry is passed as `known_agents` to Themis and used by Lachesis to resolve agent references when dispatching tasks.
+
+---
+
+## 9. Task Dispatch / Process Model
+
+**Mechanism:** Tasks run as child OS processes spawned via `subprocess.Popen`. Each task is placed in its own process group via `os.setpgid()`.
+
+**Lifecycle:**
+1. Lachesis determines a task is READY (all deps satisfied, concurrency slot available).
+2. `ProcessManager.spawn()` is called with the task definition and resolved agent definition.
+3. The task runs as a child process. Its stdout and stderr are redirected to timestamped files at `{log_dir}/{workflow_id}/{task_id}/{timestamp}.stdout` and `.stderr`.
+4. Lachesis polls the process via `ProcessManager.poll()` (non-blocking `Popen.poll()` equivalent).
+5. On exit (`poll()` returns exit code), Lachesis records the result.
+6. If exit code is non-zero and `attempts < max_retries`, the task is re-queued as READY.
+7. If exit code is non-zero and `attempts >= max_retries`, the task is marked hanging → Atropos is invoked.
+
+**Status reporting contract:**
+- Exit code 0 → task completed successfully.
+- Non-zero exit code → task failed. The stdout/stderr logs contain error details.
+- Task may write structured JSON to stdout on completion (future enhancement).
+- In v1, only exit code + log capture are used for status reporting.
+
+---
+
+## 10. Human Intervention Protocol
+
+When human intervention is required (Atropos cleanup, retry exhaustion, Clotho timeout during recovery):
+
+1. **Notification:** `HumanNotifier.request_intervention()` is called with workflow ID, task ID (if applicable), reason, and log archive path.
+2. **Decision channel:** The human makes a decision by writing to a known file (`{moirai_state_dir}/{workflow_id}/human_decision.json`). The decision schema:
+   ```json
+   {
+     "decision": "retry" | "skip" | "abort" | "restart",
+     "request_id": "uuid-of-request",
+     "reason": "Optional explanation from the human",
+     "timestamp": "2026-07-08T12:00:00Z"
+   }
+   ```
+3. **Polling:** `HumanNotifier.poll_decision()` checks the decision file at the configured polling interval. The default timeout is 24 hours (`human_response_timeout`).
+4. **Timeout:** If no decision is received within `human_response_timeout`, the system auto-aborts the workflow (fallback: `HumanDecision.ABORT`).
+5. **Resume:** Once a decision is received:
+   - `RETRY` → The failed task is reset to READY and re-dispatched (capped at one human-forced retry before re-escalating).
+   - `SKIP` → The task is marked SKIPPED; downstream tasks with SKIP as their only remaining dep become READY.
+   - `ABORT` → All pending/ready tasks are CANCELLED; running tasks are killed via Atropos; the workflow is finalized as ABORTED.
+   - `RESTART` → The entire workflow is reset; all tasks return to PENDING; execution starts from the beginning.
+
+---
+
+## 11. Workflow Descriptions
+
+### 11.1 Normal Flow (Happy Path)
+
+```
+User Prompt → Clotho → YAML → Themis → Parsed → GraphValidator → StateMachine → Lachesis → Execute Tasks
+```
+
+1. **User submits** a natural-language prompt describing the workflow.
+2. **Clotho** (LLM) generates a YAML workflow artifact.
+3. **Themis** (LLM) validates the YAML semantically — checks agent references, command plausibility, input parameter validity.
+4. **GraphValidator** (deterministic) checks structural properties — acyclicity, well-formed dependencies, topological ordering.
+5. If all checks pass, GraphValidator outputs a formal `StateMachine`.
+6. **Lachesis** takes the state machine and begins executing tasks according to the DAG.
+7. On completion, Lachesis reports a successful execution summary.
+
+### 11.2 Validation Failure Loop (Clotho ↔ Themis ↔ GraphValidator Retry)
+
+```
+Clotho → YAML → Themis → Errors → Clotho (retry) → YAML → Themis → ...
+                                                                     ↓
+                                                              GraphValidator
+                                                                     ↓
+                                                              (passes eventually)
+                                                                     ↓
+                                                              Lachesis
+```
+
+1. **Clotho** generates YAML.
+2. **Themis** rejects the YAML with structured `validation_errors` (semantic issues).
+3. Clotho receives the previous YAML + validation errors + any GraphValidator structural errors.
+4. **Clotho retries** — generates a new YAML informed by the errors. Uses exponential backoff (1s, 2s, 4s, ..., max 30s) between attempts. Clotho should produce a *different* YAML than the previous attempt — identical re-submissions are detected and rejected.
+5. If Clotho's YAML passes Themis, it goes to **GraphValidator** for structural checks.
+6. If GraphValidator finds issues, its errors are also fed back to Clotho for another retry.
+7. The cycle repeats for a configured number of retries (`max_retries`).
+8. **On success**: GraphValidator produces a state machine → passes to Lachesis.
+9. **On exhaustion**: If Clotho fails after `max_retries` attempts, the system escalates to the user with all captured errors and the last YAML attempt.
+
+### 11.3 Mid-Flight YAML Change (Task Hanging Recovery)
+
+```
+Lachesis detects hang → Clotho (with TaskInvestigator) → New YAML → Themis validates → GraphValidator → New StateMachine
+                                                                                                   ↓
+                                                                                            Penelope consolidates
+                                                                                                   ↓
+                                                                                            (can consolidate?)
+                                                                                             /            \
+                                                                                         Yes             No
+                                                                                          ↓               ↓
+                                                                               Update persistence    Clotho retries
+                                                                               Resume execution      (with consolidation errors)
+                                                                                                        ↓
+                                                                                                 (exhausted?)
+                                                                                                  /        \
+                                                                                              Yes         No
+                                                                                               ↓           ↓
+                                                                                        Human escalation  Clotho retries
+```
+
+1. **Lachesis** detects a hanging task (crashes X times, timeout exceeded).
+2. Clotho is invoked with `HangingTaskInfo` (task ID, failure reason, previous YAML, current execution state) and a bounded `TaskInvestigator` context.
+3. Clotho investigates using only the `TaskInvestigator` methods (read logs, get task state, list tasks) and generates a **new YAML** workflow.
+4. The new YAML is passed to **Themis** for semantic validation, then to **GraphValidator** for structural validation.
+5. **Penelope** compares the old and new state machines against the current execution state (captured atomically with Lachesis paused).
+6. **If consolidatable:**
+   - Penelope's two-phase process validates the plan, then applies it atomically.
+   - New tasks are added as PENDING; removed tasks (not started) are deleted; hanging task is handled per rules.
+   - Lachesis resumes execution from the next ready task.
+7. **If not consolidatable:**
+   - Clotho is told the consolidation failed with structured errors and gets another chance.
+   - Retries use exponential backoff.
+   - If this loop exhausts `max_retries`, human intervention is requested.
+8. **If Clotho times out during recovery:** This is a distinct escalation path. The workflow is now stuck with a hanging task AND a dead Clotho. Atropos has already cleaned up the hanging task. The system immediately escalates to human intervention with the full failure report, including both the original hang and the Clotho timeout. The human may retry, skip the task, or abort the workflow.
+
+### 11.4 Atropos Cleanup (Task Termination)
+
+```
+Lachesis detects hang → Atropos → Kill process group (SIGTERM → SIGKILL) → Capture logs → Archive → Request human intervention
+```
+
+1. **Lachesis** determines a task is hanging (crash limit exceeded or timeout exceeded).
+2. **Atropos** is invoked with the task's process info and failure reason.
+3. Atropos sends `SIGTERM` to the **process group** (not just the PID).
+4. Waits for `sigterm_grace_seconds`.
+5. If process group still alive, sends `SIGKILL` to the process group.
+6. If SIGKILL fails, retries up to `kill_retry_count` times.
+7. Captures stdout/stderr from the task's log files (paths from `ProcessInfo`).
+8. Archives captured logs to `{log_dir}/{workflow_id}/{task_id}/{timestamp}/`.
+9. Task is marked `failed` in persistence within an atomic transaction.
+10. Audit entry is created.
+11. **Human intervention** is requested via `HumanNotifier` — the user receives the failure report and logs and must decide how to proceed (RETRY, SKIP, ABORT, or RESTART).
+
+### 11.5 Clotho Timeout
+
+```
+Clotho runs → Timeout → Kill Clotho → Capture logs → Notify user → (if mid-flight recovery: escalate immediately to human)
+```
+
+1. **Clotho** is invoked (initial prompt or during a retry loop or mid-flight recovery).
+2. Clotho runs beyond its configured timeout.
+3. The system **kills** the Clotho process.
+4. **Logs** from Clotho's session are captured for investigation.
+5. **User notification:**
+   - If this was an *initial prompt* or *validation retry*: The flow ends (non-recoverable at this level — user may retry manually).
+   - If this was a *mid-flight recovery* (hanging task fix): The system escalates immediately to human intervention, as the workflow now has both a hanging/cleaned-up task AND a dead Clotho. The human must decide (RETRY, SKIP, ABORT, RESTART).
+
+---
+
+## 12. Error Handling and Recovery
+
+| Scenario | Trigger | Response | Recovery |
+|----------|---------|----------|----------|
+| **YAML semantic validation failure** | Themis rejects YAML | Errors returned to Clotho with previous YAML | Retry loop up to `max_retries` with exponential backoff; then human escalation |
+| **YAML structural validation failure** | GraphValidator finds cycle/bad deps | Errors returned to Clotho | Same retry loop as semantic failure |
+| **No-op retry** | Clotho emits identical YAML | Rejected by/compared against previous attempt | Counts toward `max_retries` |
+| **Task crash** | Task exits with non-zero code | Lachesis records crash, checks crash count | Retry if below `max_retries`; else invoke Atropos |
+| **Task timeout** | Task runs past `timeout` limit | Lachesis flags as hanging | Invoke Atropos |
+| **Mid-flight YAML invalid** | Themis or GraphValidator rejects new YAML during hang recovery | Errors returned to Clotho | Retry loop with backoff; exhaustion → human escalation |
+| **Consolidation failure** | Penelope finds incompatibility | Clotho retries with failure reason (plan discarded — no persistence changes made due to two-phase process) | Retry loop with backoff; exhaustion → human escalation |
+| **Clotho timeout** | Clotho exceeds its timeout limit | Kill Clotho, capture logs | If initial/validation: notify user, flow ends. If recovery: immediate human escalation with both hang and timeout context |
+| **Atropos cleanup failure** | Cannot kill process (permission, zombie) | Retry up to `kill_retry_count`; log warning | Human intervention still requested |
+| **Atropos kill retries exhausted** | All retry attempts fail | Log details, mark cleanup as FAILED | Human intervention with full failure report |
+| **Persistence error** | Read/write failure to storage | Lachesis logs error, pauses | Manual intervention to fix storage |
+| **Persistence corruption** | Checksum mismatch on state file | Lachesis refuses to load, reports corruption path | Operator must restore from backup or use `--recover` mode |
+| **Lachesis crash** | Lachesis process terminates unexpectedly | On restart: load state, clean up RUNNING tasks via Atropos, resume | Designed crash recovery (see §7.4) |
+| **Human escalation timeout** | No human decision within configured window | System auto-aborts the workflow | Configurable timeout, default 24h |
+| **User-initiated abort** | SIGINT, CLI command, or HumanDecision.ABORT | Lachesis cancels pending tasks, kills running tasks via Atropos, finalizes as ABORTED | Clean shutdown |
+
+---
+
+## 13. Configuration Parameters
+
+```python
+@dataclass
+class MoiraiConfig:
+    # Retry & timeout
+    max_retries: int = 3                       # Max Clotho→Themis cycles before escalation
+    max_crashes: int = 3                       # Max task restarts before invoking Atropos
+    task_timeout: int = 3600                   # Max seconds a task may run (default 1h)
+    clotho_timeout: int = 120                  # Max seconds Clotho has to generate YAML (default 2min)
+    themis_timeout: int = 60                   # Max seconds Themis has to validate (default 1min)
+    
+    # Atropos
+    atropos_sigterm_grace: int = 10            # Seconds after SIGTERM before SIGKILL
+    atropos_kill_retry_count: int = 3          # Retries on failed SIGKILL
+    atropos_kill_retry_delay: float = 1.0      # Seconds between kill retries
+    
+    # Logging & retention
+    log_retention_days: int = 30               # Days to keep task and component logs
+    log_dir: str = "/var/log/moirai"           # Root log directory
+    log_level: str = "INFO"                    # DEBUG, INFO, WARN, ERROR
+    
+    # Scheduling
+    max_concurrent_tasks: int = 4              # Max tasks running simultaneously
+    poll_interval_seconds: float = 1.0         # Scheduler loop polling interval
+    hang_check_interval_seconds: float = 5.0   # How often to check for hanging tasks
+    graceful_shutdown_timeout: float = 30.0    # Seconds to wait for tasks during shutdown
+    
+    # Persistence
+    persistence_backend: str = "file"          # file, sqlite, memory
+    persistence_dir: str = "/var/lib/moirai"   # For file backend
+    
+    # LLM
+    llm_api_endpoint: str = ""                 # LLM API URL
+    llm_api_key: str = ""                      # API key (loaded from env/file, not hardcoded)
+    llm_model: str = "gpt-4"                   # Model name
+    llm_max_retries: int = 3                   # Max LLM API retries on transient error
+    llm_retry_base_delay: float = 1.0          # Exponential backoff base (seconds)
+    llm_retry_max_delay: float = 30.0          # Max exponential backoff delay
+    llm_rate_limit_per_minute: int = 60        # Max LLM calls per minute
+    
+    # Human intervention
+    human_response_timeout: float = 86400.0    # Max wait for human decision (default 24h)
+    human_decision_dir: str = ""               # Dir for human decision files (default: {persistence_dir})
+    
+    # Secrets
+    secrets_provider: str = "env"              # env, file, vault
+    secrets_file: str = ""                     # Path to secrets file (if provider=file)
+```
+
+Configuration is loaded from:
+1. A YAML config file at `~/.moirai/config.yaml` (or `MOIRAI_CONFIG` env var).
+2. Environment variable overrides (e.g., `MOIRAI_TASK_TIMEOUT=7200`).
+3. All parameters are validated at startup: negative values are rejected; invalid enum values are rejected; required paths must exist. A `--dump-config` flag prints the resolved configuration and exits.
+
+---
+
+## 14. Secrets Management
+
+Secrets (LLM API keys, endpoint URLs) are loaded via a `SecretProvider` abstraction:
+
+```python
+class SecretProvider(Protocol):
+    def get(self, key: str) -> Optional[str]: ...
+```
+
+Implementations:
+- **env** (default dev): Reads from environment variables (`MOIRAI_LLM_API_KEY`, `MOIRAI_LLM_API_ENDPOINT`).
+- **file**: Reads from a JSON/YAML file at a configurable path (`secrets_file`), file permissions should be 0600.
+- **vault** (future): Pluggable interface for HashiCorp Vault, 1Password, etc.
+
+---
+
+## 15. Observability
+
+### 15.1 Structured Logging
+
+All log output is structured JSON to stdout. Log format:
+```json
+{"timestamp": "2026-07-08T12:00:00.000Z", "level": "INFO", "component": "lachesis", "event": "task_completed", "workflow_id": "abc-123", "task_id": "build", "exit_code": 0, "duration_ms": 45000}
+```
+
+Log levels: DEBUG, INFO, WARN, ERROR. Each log line includes:
+- `timestamp` (ISO 8601 with milliseconds)
+- `level` (standard log level)
+- `component` (clotho, themis, lachesis, penelope, atropos, scheduler)
+- `event` (machine-readable event name)
+- Context fields (workflow_id, task_id, etc.)
+
+Component logs also write to files under `{log_dir}/{component}/{workflow_id}/` for task-level log capture.
+
+### 15.2 Internal Metrics
+
+Moirai exposes internal counters and gauges via a simple `MetricsRegistry`:
+
+```python
+@dataclass
+class MetricsRegistry:
+    # Counters
+    tasks_completed: int = 0
+    tasks_failed: int = 0
+    tasks_timed_out: int = 0
+    atropos_invocations: int = 0
+    human_escalations: int = 0
+    clotho_invocations: int = 0
+    themis_invocations: int = 0
+    consolidation_attempts: int = 0
+    consolidation_failures: int = 0
+    llm_call_count: int = 0
+    llm_error_count: int = 0
+    persistence_errors: int = 0
+    
+    # Gauges
+    running_tasks: int = 0
+    pending_tasks: int = 0
+    queue_depth: int = 0
+    scheduler_uptime_seconds: float = 0.0
+```
+
+Metrics are logged periodically at INFO level (every 60s by default) and can be exposed on a local HTTP endpoint (`http://127.0.0.1:9091/metrics` in Prometheus text format) for production monitoring.
+
+### 15.3 Audit Trail
+
+An append-only audit log records every significant state transition, escalation, and operator action. The audit log lives at `{persistence_dir}/audit.jsonl` — a JSON-lines file where each line is an immutable entry:
+
+```json
+{"timestamp": 1712345678.0, "event_type": "human_decision", "workflow_id": "abc-123", "task_id": "build", "details": {"decision": "retry", "human_reason": "Transient network issue"}}
+```
+
+The audit log is append-only (no rewriting) and is rotated alongside regular logs.
+
+### 15.4 Health Endpoint
+
+Lachesis exposes a health-check mechanism, either via:
+- A UNIX domain socket at `{persistence_dir}/lachesis.sock` (default)
+- An HTTP endpoint on `127.0.0.1:9090/healthz` (if enabled)
+
+The health response includes:
+```json
+{"status": "ok", "uptime_seconds": 12345, "workflow_id": "abc-123", "last_task_progress": 1712345678.0, "running_tasks": 2, "queue_depth": 0}
+```
+
+This enables process supervisors (systemd, Kubernetes) to detect deadlocked or hung scheduler instances.
+
+---
+
+## 16. Task Resource Management
+
+Each task child process is wrapped with OS-level resource limits via `resource.setrlimit()`:
+
+| Resource | Limit | Rationale |
+|----------|-------|-----------|
+| `RLIMIT_CPU` | `task_timeout + 60` seconds | Prevents CPU-bound infinite loops |
+| `RLIMIT_AS` | 1 GB (configurable) | Prevents memory exhaustion |
+| `RLIMIT_FSIZE` | 100 MB (configurable) | Prevents disk fill from runaway log output |
+| `RLIMIT_NPROC` | 50 (configurable) | Prevents fork bombs |
+
+These limits are set before `exec()` in the child process, ensuring a single misbehaving task cannot DOS the scheduler or other workflows.
+
+---
+
+## 17. Workflow Cancellation
+
+A user can cancel a running workflow via:
+- **SIGINT** (Ctrl+C): Lachesis catches the signal, stops accepting new tasks, kills running tasks via Atropos, finalizes as CANCELLED.
+- **CLI command**: `moirai cancel <workflow_id>` writes a cancellation signal file that Lachesis polls.
+- **Human decision**: The operator selects ABORT via the human intervention channel.
+
+Cancellation flow:
+1. All PENDING and READY tasks are marked CANCELLED.
+2. All RUNNING tasks are passed to Atropos for process-group cleanup.
+3. A final `ExecutionLog` is persisted with outcome "cancelled".
+4. An audit entry records the cancellation.
+
+---
+
+## 18. Persistence File Format & Versioning
+
+### File Backend Format
+
+Persistence files are stored at `{persistence_dir}/{workflow_id}/state.json` with an embedded schema version for forward compatibility:
+
+```json
+{
+  "schema_version": 2,
+  "magic": "MOIRAI_STATE",
+  "checksum": "sha256hex...",
+  "workflow_id": "abc-123",
+  "state_machine_version": 1,
+  "tasks": {
+    "extract": {
+      "task_id": "extract",
+      "status": "COMPLETED",
+      "attempts": 1,
+      "started_at": 1712345678.0,
+      "completed_at": 1712345978.0,
+      "exit_code": 0,
+      "stdout_path": "/var/log/moirai/wf-abc-123/extract/stdout.log",
+      "stderr_path": "/var/log/moirai/wf-abc-123/extract/stderr.log"
+    }
+  }
+}
+```
+
+**Format guarantees:**
+- Magic bytes `MOIRAI_STATE` at the top for quick identification.
+- `schema_version` for migration checks — on startup, Lachesis refuses to load files with version > its own version.
+- SHA-256 checksum over the content (excluding the checksum field) for corruption detection.
+- Atomic writes via `os.replace()` (POSIX-atomic on local filesystems). Operators are warned that NFS v3, FAT32, exFAT, and FUSE filesystems do not guarantee atomic rename.
+
+### Corruption Recovery
+
+If a checksum mismatch is detected at startup, Lachesis:
+1. Logs the error with the expected vs actual checksum.
+2. Exits with a non-zero code and a clear error message pointing to the corrupted file.
+3. Supports a `--recover` flag that attempts: (a) load the most recent backup if available, (b) truncate to last valid JSON boundary, (c) report the recovery outcome.
+
+### Schema Migration
+
+On startup, Lachesis compares the `schema_version` in the persistence file against its compiled-in version:
+- If file version < binary version: automatic migration (forward-compatible).
+- If file version > binary version: refuse to start with clear message ("Persistence file is from a newer version of Moirai. Upgrade Moirai to read this file.").
+
+---
+
+## 19. Testing Strategy
+
+### 19.1 Unit Testing
+
+Every component is testable in isolation via its protocol interfaces:
+
+| Component | Test Strategy |
+|-----------|---------------|
+| **Clotho** | Inject `FakeLLMClient` that returns predefined YAML strings; test retry logic with fake validation errors; test investigation with fake `TaskInvestigator` |
+| **Themis** | Inject `FakeLLMClient` that returns predefined validation results; test error shaping |
+| **GraphValidator** | Pure function tests with table-driven graph fixtures (acyclic, cyclic, empty, single-node, diamond, disconnected) |
+| **Lachesis** | Inject `FakePersistenceBackend`, `FakeProcessManager`, `FakeTimeProvider`; test DAG traversal, concurrency limits, hang detection, ready-queue logic |
+| **Penelope** | Pure function tests — table-driven old/new SM + execution state combinations; verify consolidation plan correctness |
+| **Atropos** | Inject `FakeProcessManager` (simulates signal handling), `FakeHumanNotifier`; test cleanup sequence |
+| **HumanIntervention** | Inject fake file-based decision channel; test polling, timeout, fallback |
+| **Config** | Test validation of every parameter boundary (negative values, missing paths, invalid enums) |
+
+### 19.2 Integration Testing
+
+- **Clotho↔Themis↔GraphValidator loop**: Wire components with `FakeLLMClient` that returns controllable error patterns. Test retry exhaustion, backoff behavior, no-op detection.
+- **Lachesis↔Penelope consolidation**: Wire with `FakePersistenceBackend`, test mid-flight change scenarios.
+- **Full pipeline**: End-to-end test with `FakeLLMClient` + `FakeProcessManager` + `MemoryBackend` + `FakeTimeProvider`.
+
+### 19.3 Property-Based Testing
+
+Key invariants suitable for property-based (Hypothesis-style) testing:
+- "For any valid StateMachine DAG, Lachesis eventually completes all reachable tasks in topological order."
+- "For any two StateMachines and any consistent ExecutionState, Penelope produces a ConsolidationPlan that is either valid or identifies specific blocking errors."
+- "For any valid DAG, GraphValidator's topological sort produces an order where every task appears after all its dependencies."
+- "Consolidation is idempotent: applying the same plan twice to the same state produces the same result."
+
+### 19.4 Test Infrastructure
+
+- `FakeLLMClient` in `tests/fakes/llm_client.py`
+- `FakeProcessManager` in `tests/fakes/process_manager.py`
+- `MemoryBackend` (already part of persistence module for single-run mode)
+- `FakeTimeProvider` with manual time advancement
+- `FakeHumanNotifier` with programmable decision injection
+- `MoiraiTestHarness` for wiring components with test doubles
+
+---
+
+## 20. Assumptions
+
+The following assumptions are made about the system's environment and design. These should be validated as the project evolves.
+
+1. **LLM availability**: Clotho and Themis have access to a configured LLM endpoint (API or local model). The system does not bundle or manage the LLM itself.
+
+2. **YAML schema stability**: The YAML workflow artifact schema is versioned and documented (see §5). Changes to the schema are backward-compatible or coordinated across all components.
+
+3. **Task identity stability**: Task IDs are stable across YAML versions. Penelope uses `task_id` to correlate tasks between old and new state machines.
+
+4. **Process isolation**: Tasks run as child processes of the scheduler, placed in their own process groups via `os.setpgid()`. This allows Atropos to kill entire process trees via `os.killpg()`.
+
+5. **Persistence durability**: The persistence layer provides atomic state transitions. For file-based backend: POSIX `os.replace()` is atomic on local filesystems (ext4, XFS, Btrfs, APFS, NTFS). NFS v3, FAT32, exFAT, and FUSE filesystems do NOT guarantee atomic rename — operators should use SQLite backend or verify filesystem semantics.
+
+6. **Single-scheduler model**: There is one Lachesis instance per workflow. Distributed execution is not in scope for the initial design. **Known HA gap**: if the host running Lachesis dies, all in-flight workflows are lost unless the persistence layer is on remote storage and crash recovery is implemented.
+
+7. **Human intervention channel**: The system notifies humans via `HumanNotifier` (file signal, stdout, or UI callback). Humans respond by writing a decision file. If no response within `human_response_timeout`, the system auto-aborts.
+
+8. **No cyclic dependencies**: GraphValidator guarantees that the state machine is a DAG via deterministic cycle detection. Lachesis does not handle or detect cycles.
+
+9. **Homogeneous agent interface**: All agents expose a consistent interface: child process with exit code reporting. The exact command and environment are defined per-agent in the agent registry (see §8).
+
+10. **Clotho's investigation is bounded**: When invoked for mid-flight hang recovery, Clotho can use only the methods provided by the `TaskInvestigator` protocol (read logs up to 200 lines, get task state, list workflow tasks, get workflow context). No unbounded system access.
+
+11. **Themis renaming**: The existing Hermes profile named `themis` will need to be renamed before this component is implemented, to avoid a naming conflict.
+
+12. **POSIX platform**: Moirai targets POSIX-compatible systems (Linux, macOS). Windows is not supported in v1. Process signaling, process groups, and `setrlimit` are POSIX-specific.
+
+---
+
+## 21. Open Questions
+
+The following questions are not yet resolved and require design decisions:
+
+1. ~~**What is the YAML schema?**~~ **RESOLVED** — See §5 YAML Workflow Schema.
+
+2. ~~**How does Lachesis dispatch tasks?**~~ **RESOLVED** — Subprocess with process-group isolation. See §9 Task Dispatch / Process Model.
+
+3. ~~**What is the persistence format?**~~ **RESOLVED** — JSON with magic bytes, schema version, and checksum. See §18.
+
+4. **How does Lachesis discover and poll task completion?** Non-blocking `ProcessManager.poll()` on the scheduler loop. The exact poll-vs-waitpid tradeoff is resolved in §7.4.
+
+5. ~~**What is the state machine representation?**~~ **RESOLVED** — `StateMachine` dataclass in §3.
+
+6. **How does Clotho escalate to the user?** Interactive prompt? File signal? Exit code? The escalation mechanism is standardized via `HumanNotifier` in v2, but the exact UX for Clotho-specific escalations (ambiguous prompt) is still TBD.
+
+7. **Is there a web UI or CLI?** The note implies CLI usage (`moirai <prompt>`). CLI is implemented via `__main__.py`. A web UI is out of scope for v1/v2.
+
+8. ~~**How are known agents registered?**~~ **RESOLVED** — YAML config file. See §8 Agent Registry.
+
+9. ~~**What happens when human intervention is requested?**~~ **RESOLVED** — Polling-based decision channel with timeout. See §10.
+
+10. **What if Clotho and Themis use different LLMs?** The `LLMClient` protocol abstracts the provider. Each component receives its own configured client. The config supports different endpoints/models per component.
+
+11. ~~**How are validation errors structured?**~~ **RESOLVED** — `ValidationError` dataclass. See §3.
+
+12. **What about concurrent workflows?** Can Lachesis run multiple state machines concurrently? v1 is single-workflow per Lachesis instance. Multiple workflows = multiple Lachesis processes. This is TBD for a future version.
+
+13. ~~**Is there a recovery file for Lachesis crashes?**~~ **RESOLVED** — Yes, crash recovery via persisted ExecutionState. See §7.4 (Lachesis crash recovery) and §18 (persistence format).
+
+14. **What is the CLI interface?** The exact CLI syntax (`moirai "prompt"`, `moirai run --file workflow.yaml`, `moirai cancel <id>`, `moirai status <id>`) needs full specification.
+
+15. **Is there a web UI?** Out of scope for v1/v2. Future consideration.
+
+---
+
+## 22. Glossary
+
+| Term | Definition |
+|------|------------|
+| **Moirai** | The project itself; named after the three Fates of Greek mythology |
+| **Clotho** | Spinner — LLM component that turns user prompts into YAML workflows |
+| **Themis** | Titaness of divine law — LLM component that validates YAML semantically |
+| **GraphValidator** | Deterministic component that checks DAG acyclicity and structural well-formedness |
+| **Lachesis** | Measurer — deterministic scheduler that executes the state machine |
+| **Penelope** | Weaver — deterministic consolidation component that diffs old and new state machines |
+| **Atropos** | Cutter — cleanup component that terminates hanging tasks and captures logs |
+| **State Machine** | Formal representation of the workflow as a directed acyclic graph (DAG) of tasks |
+| **YAML Artifact** | The workflow definition file generated by Clotho and consumed by Themis |
+| **Task** | A single unit of work in the workflow, with properties, agent assignment, and dependencies |
+| **Agent** | An executor that can run a task (a process with a known command and environment) |
+| **Agent Registry** | A configuration file listing available agents with their interfaces |
+| **Consolidation** | The process of reconciling a new state machine with an ongoing execution |
+| **Human Intervention** | Escalation to a person when automatic recovery is exhausted or impossible, with a defined decision protocol |
+| **Process Group** | OS-level process grouping that enables killing entire process trees |
+| **Persistence Backend** | Storage interface for task state (file-based, in-memory, or SQLite) |
+| **LLMClient** | Protocol abstracting LLM API calls for testability |
+| **TaskInvestigator** | Bounded context for Clotho to investigate hanging tasks |
+| **HumanNotifier** | Interface for requesting and polling human decisions |
+
+---
+
+## 23. Version History
+
+| Version | Date | Author | Changes |
+|---------|------|--------|---------|
+| 2 | 2026-07-08 | Daedalus (architect) | **Major update addressing all 4 agent reviews:** Added core data structures (§3), protocol interfaces (§4), YAML workflow schema (§5), GraphValidator component (§6), agent registry (§8), task dispatch/process model (§9), human intervention protocol (§10), secrets management (§14), observability (§15), resource management (§16), workflow cancellation (§17), persistence format & versioning (§18), testing strategy (§19), crash recovery (in §7.4), consolidation atomicity (in §7.5), retry backoff (in §7.1, §7.2), Clotho timeout recovery path (in §11.5), process-group cleanup (in §7.6), structured logging (in §15.1), metrics (in §15.2), audit trail (in §15.3), health checks (in §15.4), configuration validation (in §13), secrets management (§14), config validation (§13), no-op retry detection (in §7.1), modified-task compatibility matrix (in §7.5), concurrency config (in §7.4), graceful shutdown (in §7.4), persistence versioning (in §18), platform assumptions (in §20.12). Resolved 9 open questions. |
+| 1 | 2026-07-08 | Hermes Agent | Initial specification from architecture thoughts wiki note |
