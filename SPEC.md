@@ -1878,7 +1878,7 @@ The following assumptions are made about the system's environment and design. Th
 
 ## 21. Open Questions
 
-The following questions are not yet resolved and require design decisions:
+The following questions were resolved during the v5 spec cycle. All 13 original open questions are now closed:
 
 1. ~~**What is the YAML schema?**~~ **RESOLVED** — See §5 YAML Workflow Schema.
 
@@ -1886,33 +1886,33 @@ The following questions are not yet resolved and require design decisions:
 
 3. ~~**What is the persistence format?**~~ **RESOLVED** — JSON with magic bytes, schema version, and checksum. See §18.
 
-4. **How does Lachesis discover and poll task completion?** Non-blocking `ProcessManager.poll()` on the scheduler loop. The exact poll-vs-waitpid tradeoff is resolved in §7.4.
+4. ~~**How does Lachesis discover and poll task completion?~~** **RESOLVED (v5)** — Non-blocking `ProcessManager.poll()` on the scheduler loop. See §7.4.
 
 5. ~~**What is the state machine representation?**~~ **RESOLVED** — `StateMachine` dataclass in §3.
 
-6. **How does Clotho escalate to the user?** Interactive prompt? File signal? Exit code? The escalation mechanism is standardized via `HumanNotifier` in v2, but the exact UX for Clotho-specific escalations (ambiguous prompt) is still TBD.
+6. ~~**How does Clotho escalate to the user?~~** **RESOLVED (v5)** — Interactive prompts via the CLI. When Clotho needs to escalate (ambiguous prompt, investigation dead-end), the escalation uses the `HumanNotifier` protocol with the file-based decision channel. The CLI surfaces escalations as interactive prompts to the user. See §10 and §7.8.
 
-7. **Is there a web UI or CLI?** The note implies CLI usage (`moirai <prompt>`). CLI is implemented via `__main__.py`. A web UI is out of scope for v1/v2.
+7. ~~**Is there a web UI or CLI?~~** **RESOLVED (v5)** — CLI is implemented via `__main__.py` with argparse. Full CLI surface defined in §7.8. A web UI is out of scope for v1/v2 — acknowledged as a future consideration.
 
 8. ~~**How are known agents registered?**~~ **RESOLVED** — YAML config file. See §8 Agent Registry.
 
 9. ~~**What happens when human intervention is requested?**~~ **RESOLVED** — Polling-based decision channel with timeout. See §10.
 
-10. **What if Clotho and Themis use different LLMs?** The `LLMClient` protocol abstracts the provider. Each component receives its own configured client. The config supports different endpoints/models per component.
+10. ~~**What if Clotho and Themis use different LLMs?~~** **RESOLVED (v5)** — The `LLMClient` protocol abstracts the provider. Each component receives its own configured client. The config supports different endpoints/models per component. See §4.1 and §13. Only Clotho is LLM-powered in v5 — Themis is now fully deterministic, so this question is moot for the current design.
 
 11. ~~**How are validation errors structured?**~~ **RESOLVED** — `ValidationError` dataclass. See §3.
 
-12. **What about concurrent workflows?** Can Lachesis run multiple state machines concurrently? v1 is single-workflow per Lachesis instance. Multiple workflows = multiple Lachesis processes. This is TBD for a future version.
+12. ~~**What about concurrent workflows?~~** **RESOLVED (v5)** — v1 is single-workflow per Lachesis instance. Multiple workflows = multiple Lachesis processes. This is documented in §20 (single-workflow assumption). Future enhancement.
 
 13. ~~**Is there a recovery file for Lachesis crashes?**~~ **RESOLVED** — Yes, crash recovery via persisted ExecutionState. See §7.4 (Lachesis crash recovery) and §18 (persistence format).
 
-14. **What is the CLI interface?** The exact CLI syntax (`moirai "prompt"`, `moirai run --file workflow.yaml`, `moirai cancel <id>`, `moirai status <id>`) needs full specification.
+14. ~~**What is the CLI interface?~~** **RESOLVED (v5)** — Full CLI surface defined in §7.8. Command table includes `run`, `create template`, `list templates/jobs`, `status`, `cancel`, `update`, `review`, and `--dump-config`.
 
-15. **Is there a web UI?** Out of scope for v1/v2. Future consideration.
+15. ~~**Is there a web UI?~~** **RESOLVED (v5)** — Out of scope for v1/v2. Future consideration. CLI is the primary interface (see §7.8).
 
 16. ~~**How does context pass between loop iterations?**~~ **RESOLVED (v4)** — LoopExecutor sets environment variables `MOIRAI_LOOP_ITERATION=N`, `MOIRAI_PREV_OUTPUT=<output>`, and per-step `MOIRAI_PREV_OUTPUTS_<STEP_ID>=<output>` for each inner step. See §7.4 (item 6) and §4.7 (`LoopExecutor.build_iteration_context()`).
 
-17. **Can loop steps be nested?** v3 does not support nested loops (a loop step's inner steps cannot themselves be loop steps). This is a future enhancement.
+17. ~~**Can loop steps be nested?~~** **RESOLVED (v5)** — v3/v4/v5 does not support nested loops (a loop step's inner steps cannot themselves be loop steps). This is documented as out of scope for v1.
 
 ---
 
