@@ -10,6 +10,9 @@ dependencies = [
 [project.urls]
 repository = "https://github.com/NamalD/moirai"
 
+[project.scripts]
+moirai = "moirai.__main__:main"
+
 [build-system]
 requires = ["hatchling"]
 build-backend = "hatchling.build"
