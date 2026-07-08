@@ -65,11 +65,11 @@ All agents working on this project follow these rules:
 
    | Profile | Git Author |
    |---------|-----------|
-   | `daedalus` / `default` | Daedalus <daedalus@namal.dev> |
-   | `hephaestus` | Hephaestus <hephaestus@namal.dev> |
-   | `themis` | Themis <themis@namal.dev> |
-   | `argus` | Argus <argus@namal.dev> |
-   | `atlas` | Atlas <atlas@namal.dev> |
+   | `daedalus` / `default` | NamalD <namald@users.noreply.github.com> |
+   | `hephaestus` | Claude Code <claude-code@namald.users.noreply.github.com> |
+   | `themis` | Themis <themis@namald.users.noreply.github.com> |
+   | `argus` | Argus <argus@namald.users.noreply.github.com> |
+   | `atlas` | Atlas <atlas@namald.users.noreply.github.com> |
 
    Scripts live at `~/.hermes/scripts/set-git-author-*.sh` and are referenced in each profile's `terminal.shell_init_files` in their `config.yaml`.
 5. **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:

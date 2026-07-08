@@ -2075,11 +2075,11 @@ The following conventions govern agent interactions with the Moirai project:
 - **Agent git authorship (baked into profiles).** Each Hermes profile sets its own git author name and `@namal.dev` email automatically via `terminal.shell_init_files`:
   | Profile | Git Author |
   |---------|-----------|
-  | `daedalus` / `default` | Daedalus <daedalus@namal.dev> |
-  | `hephaestus` | Hephaestus <hephaestus@namal.dev> |
-  | `themis` | Themis <themis@namal.dev> |
-  | `argus` | Argus <argus@namal.dev> |
-  | `atlas` | Atlas <atlas@namal.dev> |
+  | `daedalus` / `default` | NamalD <namald@users.noreply.github.com> |
+  | `hephaestus` | Claude Code <claude-code@namald.users.noreply.github.com> |
+  | `themis` | Themis <themis@namald.users.noreply.github.com> |
+  | `argus` | Argus <argus@namald.users.noreply.github.com> |
+  | `atlas` | Atlas <atlas@namald.users.noreply.github.com> |
   
   Agents do not need to set these manually — the env vars are exported at shell init via scripts in `~/.hermes/scripts/set-git-author-*.sh`. If you're adding a new agent profile, create the corresponding script and add it to the profile's `terminal.shell_init_files`.
 - **Structured commit messages.** Every commit references the issue number and includes a `[Phase N]` tag:
