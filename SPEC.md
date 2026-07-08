@@ -39,13 +39,15 @@ At a high level, Moirai:
 ```
 moirai/
 ├── __init__.py            # Pipeline wiring, entry point
-├── __main__.py            # CLI entry point: python -m moirai
+├── __main__.py            # CLI entry point: python -m moirai (argparse-based CLI, see §7.8)
+├── cli.py                 # CLI command handlers (run, create template, list, status, cancel, review, update)
 ├── config.py              # Config dataclass, env/file loading, validation
 ├── types.py               # All shared data structures (dataclasses, TypedDicts)
 ├── protocols.py           # All interface protocols (LLMClient, PersistenceBackend, etc.)
-|├── clotho.py              # Clotho — LLM-powered YAML generation (only LLM component)
+├── clotho.py              # Clotho — LLM-powered YAML generation (only LLM component)
 ├── themis.py              # Themis — deterministic YAML validation + state machine generation (contains GraphValidator as internal class)
 ├── graph_validator.py     # (Deprecated in v5 — folded into themis.py as Themis._graph_validator)
+├── templates.py           # Template loading, parameter substitution, validation (see §7.7)
 ├── lachesis.py            # Lachesis — deterministic scheduler
 ├── loop_executor.py       # LoopExecutor — standalone loop iteration manager
 ├── penelope.py            # Penelope — deterministic consolidation
@@ -1101,6 +1103,146 @@ When Lachesis encounters a loop step (identified by the presence of a `LoopDef` 
 - Human intervention means a person picks up the failure report and decides how to proceed (retry, skip, abort, continue) — polled via `HumanNotifier.poll_decision()`.
 - Atropos does NOT attempt to fix the task — it only cleans up and escalates.
 - Atropos has a retry loop for cleanup failures (up to `kill_retry_count` retries on failed kill), after which it logs a warning and still escalates.
+
+---
+
+### 7.7 Template Workflows (v5)
+
+**Role:** Template workflows provide a mechanism for standard development workflows to be saved and reused without Clotho regenerating YAML from scratch each time. Templates contain parameterized placeholders for user prompts and project-specific values.
+
+**Nature:** Deterministic. Template files are YAML documents with placeholder substitution.
+
+**Template YAML format:**
+
+```yaml
+# ~/.moirai/templates/dev-workflow.yaml
+name: "dev-workflow"
+description: "Standard development workflow: implement, review, fix"
+version: 1
+
+parameters:
+  - name: project
+    description: "Project directory path"
+    required: true
+  - name: prompt
+    description: "Task description for the implementation step"
+    required: true
+  - name: dev_agent
+    description: "Agent ID for development tasks"
+    default: "hermes-dev"
+  - name: review_agent
+    description: "Agent ID for review tasks"
+    default: "hermes-review"
+  - name: max_loop_attempts
+    description: "Maximum loop iterations for review-fix cycle"
+    default: 5
+  - name: deploy_step
+    description: "Include deploy step after completion"
+    default: false
+
+workflow:
+  id: "{{ .project }}-{{ .prompt | slugify }}"
+  name: "{{ .project }}: {{ .prompt }}"
+  version: 1
+  
+  agents:
+    - id: "{{ .dev_agent }}"
+      name: "{{ .dev_agent }}"
+      command: "hermes --profile {{ .dev_agent }}"
+    - id: "{{ .review_agent }}"
+      name: "{{ .review_agent }}"
+      command: "hermes --profile {{ .review_agent }}"
+  
+  tasks:
+    - id: "implement"
+      type: "agent"
+      agent: "{{ .dev_agent }}"
+      command: "{{ .dev_agent }} implement --project {{ .project }} \"{{ .prompt }}\""
+      deps: []
+      max_retries: 2
+    
+    - id: "review-loop"
+      type: loop
+      max_iterations: {{ .max_loop_attempts }}
+      terminate_on: "APPROVED"
+      deps: ["implement"]
+      steps:
+        - id: "review"
+          agent: "{{ .review_agent }}"
+          command: "{{ .review_agent }} review --project {{ .project }}"
+          deps: []
+        - id: "fix"
+          type: "agent"
+          agent: "{{ .dev_agent }}"
+          command: "{{ .dev_agent }} fix --project {{ .project }} --review-feedback {{ .project }}/review-output.md"
+          deps: ["review"]
+
+    - id: "deploy"
+      type: "script"
+      agent: "ci-agent"
+      command: "./scripts/deploy.sh {{ .project }}"
+      deps: ["review-loop"]
+      {{ if not .deploy_step }}enabled: false{{ end }}
+```
+
+**Template storage:** Templates are stored as `.yaml` files in:
+1. `~/.moirai/templates/` — user-local templates
+2. `{project}/.moirai/templates/` — project-specific templates
+3. Built-in templates (shipped with Moirai)
+
+**Template instantiation:** When a template is used:
+1. Clotho parses the template YAML.
+2. Parameter values are substituted using Go-style `{{ .param }}` syntax.
+3. The `prompt` parameter is the only required user input — all other parameters have defaults.
+4. The instantiated YAML is then passed through the normal Themis → Lachesis pipeline.
+
+**Assumptions:**
+- Templates are validated at load time (syntax, required parameters, valid workflow structure).
+- Template instantiation is deterministic — same parameters → same YAML.
+- Clotho is NOT invoked for template-based workflows (the template already has the YAML). Clotho is only used when no template matches.
+
+---
+
+## 7.8 CLI Surface (v5)
+
+Moirai exposes a command-line interface via `python -m moirai` (or the installed `moirai` entry point):
+
+| Command | Description |
+|---------|-------------|
+| `moirai run [--prompt "..." --project <path>]` | Run an ad-hoc workflow. Generates a new YAML via Clotho and executes it |
+| `moirai run --template <name> [--project <path> --prompt "..." --param key=value ...]` | Run a template workflow. Fills in template parameters and executes |
+| `moirai create template <name> --file <path>` | Register a new template from an existing YAML file |
+| `moirai create template <name> --from-workflow <workflow_id>` | Save an executed workflow as a template |
+| `moirai list templates` | List available templates with descriptions |
+| `moirai list jobs` | List running/completed workflows |
+| `moirai status <workflow_id>` | View state machine for a workflow: completed, running, pending, hanging tasks |
+| `moirai cancel <workflow_id>` | Cancel a running workflow |
+| `moirai update <workflow_id> --prompt "..."` | (Future) Trigger a user-driven mid-flight YAML change |
+| `moirai review --project <path> --yaml <file>` | Review a YAML workflow before executing (shows parsed state machine, task list, agent assignments) |
+| `moirai --dump-config` | Print resolved configuration and exit |
+
+**Flags:**
+- `--prompt`: Natural-language prompt describing the workflow
+- `--project`: Target project directory (default: current directory)
+- `--template`: Name of a template workflow to use
+- `--param`: Template parameters in `key=value` format (repeatable)
+- `--review`: Pause before execution to show the parsed YAML for approval
+- `--yaml`: Path to a pre-existing YAML workflow file (bypasses Clotho)
+- `--verbose` / `--debug`: Increase log verbosity
+
+**Review flow:** When `--review` is passed, Moirai:
+1. Generates (or loads) the YAML workflow.
+2. Parses it via Themis and shows the state machine: task list, dependencies, agent assignments, and loop steps.
+3. Pauses and asks the user to confirm before proceeding.
+4. On confirmation, hands the state machine to Lachesis for execution.
+
+**CLI architecture:** The CLI is implemented in `moirai/__main__.py` using Python's `argparse` (stdlib). It parses commands, loads configuration, and calls the appropriate pipeline entry point.
+
+**Assumptions:**
+- CLI is the primary user interface for v1. Web UI/API is future work (see §21 Q15).
+- The CLI is synchronous — commands block until the workflow completes or `--detach` is supported (future).
+- `moirai status` reads from the persistence layer to display workflow state.
+- Template management (`create template`, `list templates`) operates on the `~/.moirai/templates/` directory.
 
 ---
 

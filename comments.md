@@ -889,14 +889,16 @@ As a developer sitting down to write `moirai/__init__.py` and the first componen
 
 ---
 
-- [ ] @user: **Template workflows** — Need a template workflow system so standard development workflows can be saved and reused without Clotho regenerating YAML each time. CLI usage: `moirai --template dev-workflow --project apps/warframe-tracker --prompt "Implement logging"`. Should allow filling in placeholder prompts only.
+- [x] @user: **Template workflows** — Need a template workflow system so standard development workflows can be saved and reused without Clotho regenerating YAML each time. CLI usage: `moirai --template dev-workflow --project apps/warframe-tracker --prompt "Implement logging"`. Should allow filling in placeholder prompts only.
+  > @daedalus: Addressed in v5. Added §7.7 Template Workflows with full YAML template format including parameterized placeholders (`{{ .param }}`), storage layout (`~/.moirai/templates/`, project-level `.moirai/templates/`, built-in), and CLI usage pattern. Templates are deterministic — Clotho is bypassed when a template matches. Instantiation uses Go-style `{{ .param }}` syntax with only `prompt` being a required user input.
 
-- [ ] @user: **CLI surface** — Define a CLI for interacting with Moirai. Required capabilities:
+- [x] @user: **CLI surface** — Define a CLI for interacting with Moirai. Required capabilities:
   - `moirai create template` — generate and save a well-formed template workflow with configurable project, prompt, dev agent, review agent, max loop attempts, deploy step.
   - `moirai run` — run ad-hoc tasks without a template, generating a new YAML file and filling out the prompt.
   - Option to review generated YAML before proceeding.
   - View running jobs.
   - View state machine for a job with details on completed/running/hanging tasks.
+  > @daedalus: Addressed in v5. Added §7.8 CLI Surface with full command table (run, create template, list templates/jobs, status, cancel, update, review, dump-config), flags (--prompt, --project, --template, --param, --review, --yaml, --verbose/--debug), and review flow documentation. CLI architecture uses Python `argparse` in `__main__.py` with handler module `cli.py`. Synchronous execution for v1. See SPEC.md §7.8.
 
 - [x] @user: **Only Clotho should be LLM-powered** — Themis should be a deterministic component for YAML validation and state machine generation (no LLM required). GraphValidator can fold into Themis as a class/component. All other components (Lachesis, Atropos) are deterministic coded components.
   > @daedalus: Addressed in v5. Themis is now fully deterministic — no LLM involvement. GraphValidator is an internal class within Themis (`Themis._graph_validator`). The pipeline is now: Clotho (LLM, only non-deterministic) → YAML → Themis (deterministic, parse + validate + GraphValidator) → StateMachine → Lachesis. Updated §1 overview, §2 module structure (graph_validator.py marked deprecated), §5 YAML parsing, §6 GraphValidator (internal to Themis), §7.2 Themis (deterministic), §7.3 GraphValidator (internal class), §11 pipeline diagrams, §22 glossary. See SPEC.md v5 changes.
